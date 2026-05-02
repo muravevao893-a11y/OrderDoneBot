@@ -4,6 +4,8 @@ import imaplib
 import os
 import re
 import sqlite3
+import inspect
+from functools import wraps
 from dataclasses import dataclass
 from datetime import datetime
 from email import message_from_bytes
@@ -176,11 +178,19 @@ def set_state(key: str, value: str) -> None:
 
 
 def only_admin(handler):
+    # Aiogram 3 прокидывает в обработчики служебные аргументы через DI
+    # (например dispatcher, bot, state, command). Передаём в исходный
+    # handler только те аргументы, которые он реально принимает.
+    handler_signature = inspect.signature(handler)
+    allowed_kwargs = set(handler_signature.parameters.keys())
+
+    @wraps(handler)
     async def wrapper(message: Message, *args, **kwargs):
         if settings.admin_ids and message.from_user and message.from_user.id not in settings.admin_ids:
             await message.answer("Нет доступа.")
             return
-        return await handler(message, *args, **kwargs)
+        filtered_kwargs = {key: value for key, value in kwargs.items() if key in allowed_kwargs}
+        return await handler(message, *args, **filtered_kwargs)
 
     return wrapper
 
