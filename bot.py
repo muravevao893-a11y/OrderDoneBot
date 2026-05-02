@@ -19,7 +19,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -108,6 +108,7 @@ def load_settings() -> Settings:
 
 settings = load_settings()
 router = Router()
+BUILD_VERSION = "reset-v2-2026-05-02"
 
 
 class ManualOrder(StatesGroup):
@@ -303,6 +304,39 @@ def get_order(order_id: int) -> Optional[sqlite3.Row]:
         return con.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
 
 
+def get_recent_orders(limit: int = 10) -> list[sqlite3.Row]:
+    with db_connect() as con:
+        return con.execute(
+            "SELECT * FROM orders ORDER BY id DESC LIMIT ?",
+            (max(1, min(int(limit), 30)),),
+        ).fetchall()
+
+
+def reset_orders_table() -> None:
+    # Полностью очищает историю заказов и сбрасывает AUTOINCREMENT.
+    # После этого следующий заказ снова будет №000001.
+    with db_connect() as con:
+        con.execute("DELETE FROM orders")
+        con.execute("DELETE FROM sqlite_sequence WHERE name = 'orders'")
+
+
+def delete_order_record(order_id: int) -> bool:
+    with db_connect() as con:
+        cur = con.execute("DELETE FROM orders WHERE id = ?", (order_id,))
+        return cur.rowcount > 0
+
+
+async def try_delete_channel_message(bot: Bot, row: sqlite3.Row) -> None:
+    channel_message_id = row["channel_message_id"]
+    if not channel_message_id:
+        return
+    try:
+        await bot.delete_message(settings.channel_id, int(channel_message_id))
+    except Exception:
+        # Не валим команду, если Telegram не дал удалить пост.
+        pass
+
+
 async def publish_order(bot: Bot, order_id: int) -> Optional[int]:
     row = get_order(order_id)
     if not row:
@@ -362,7 +396,7 @@ async def cmd_start(message: Message) -> None:
     mode = "полный автомат" if settings.auto_publish else "предпросмотр с подтверждением"
     email_status = "включена" if settings.email_enabled else "выключена"
     await message.answer(
-        "Привет. Я бот для автопостинга выполненных заказов в канал.\n\n"
+        f"Привет. Я бот для автопостинга выполненных заказов в канал.\nВерсия: <b>{BUILD_VERSION}</b>\n\n"
         f"Режим публикации: <b>{html.escape(mode)}</b>\n"
         f"Проверка почты: <b>{html.escape(email_status)}</b>\n\n"
         "Команды:\n"
@@ -371,7 +405,21 @@ async def cmd_start(message: Message) -> None:
         "<code>/done</code> — пошаговое добавление\n"
         "<code>/checkmail</code> — проверить почту сейчас\n"
         "<code>/drafts</code> — черновики из почты\n"
-        "<code>/stats</code> — статистика",
+        "<code>/orders</code> — последние заказы и удаление тестовых\n"
+        "<code>/delete_order 2</code> или <code>/del 2</code> — удалить заказ по номеру\n"
+        "<code>/reset_orders</code> или <code>/reset</code> — удалить все заказы и сбросить нумерацию\n"
+        "<code>/stats</code> — статистика\n<code>/version</code> — проверить, что Railway запустил новую версию",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("version", "health"))
+@only_admin
+async def cmd_version(message: Message) -> None:
+    await message.answer(
+        f"✅ Бот живой. Версия: <b>{BUILD_VERSION}</b>\n"
+        f"База: <code>{html.escape(settings.db_path)}</code>\n"
+        f"Почта: <b>{'включена' if settings.email_enabled else 'выключена'}</b>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -463,6 +511,73 @@ async def cmd_stats(message: Message) -> None:
     )
 
 
+@router.message(Command("orders", "list"))
+@only_admin
+async def cmd_orders(message: Message) -> None:
+    rows = get_recent_orders(10)
+    if not rows:
+        await message.answer("Заказов пока нет. Нумерация начнётся с <b>№000001</b>.", parse_mode=ParseMode.HTML)
+        return
+
+    await message.answer(
+        "Последние заказы. Можно удалить тестовый заказ кнопкой ниже.\n\n"
+        "Если хочешь полностью обнулить историю и нумерацию, используй <code>/reset_orders</code>.",
+        parse_mode=ParseMode.HTML,
+    )
+    for row in rows:
+        status = html.escape(str(row["status"]))
+        title = html.escape(str(row["title"]))
+        amount = format_money(int(row["amount"] or 0), str(row["currency"] or settings.default_currency))
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{int(row['id'])}")]]
+        )
+        await message.answer(
+            f"🔢 <b>№{int(row['id']):06d}</b>\n"
+            f"Статус: <b>{status}</b>\n"
+            f"Сумма: <b>{html.escape(amount)}</b>\n"
+            f"Услуга: {title}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+
+
+@router.message(Command("delete_order", "del", "delete"))
+@only_admin
+async def cmd_delete_order(message: Message, command: CommandObject, bot: Bot) -> None:
+    raw = (command.args or "").strip()
+    if not raw or not raw.isdigit():
+        await message.answer("Напиши номер заказа. Пример: <code>/delete_order 2</code>", parse_mode=ParseMode.HTML)
+        return
+
+    order_id = int(raw)
+    row = get_order(order_id)
+    if not row:
+        await message.answer(f"Заказ №{order_id:06d} не найден.")
+        return
+
+    await try_delete_channel_message(bot, row)
+    delete_order_record(order_id)
+    await message.answer(f"Удалил заказ №{order_id:06d} из базы ✅")
+
+
+@router.message(Command("reset_orders", "reset"))
+@only_admin
+async def cmd_reset_orders(message: Message) -> None:
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Да, удалить всё и сбросить №", callback_data="reset_orders_confirm")],
+            [InlineKeyboardButton(text="Отмена", callback_data="reset_orders_cancel")],
+        ]
+    )
+    await message.answer(
+        "⚠️ Это удалит <b>все заказы из базы</b> и сбросит нумерацию.\n\n"
+        "После этого следующий пост будет <b>Заказ №000001</b>.\n"
+        "Тестовые посты в канале бот тоже попробует удалить, если они были опубликованы им.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
 @router.message(Command("drafts"))
 @only_admin
 async def cmd_drafts(message: Message) -> None:
@@ -494,6 +609,59 @@ async def cmd_checkmail(message: Message, bot: Bot) -> None:
         await message.answer(f"Ошибка проверки почты: <code>{html.escape(str(exc))}</code>", parse_mode=ParseMode.HTML)
         return
     await message.answer(f"Готово. Новых выполненных заказов найдено: <b>{count}</b>", parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("delete:"))
+async def cb_delete_order(callback: CallbackQuery, bot: Bot) -> None:
+    if not is_admin_user(callback.from_user.id if callback.from_user else None):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    order_id = int(callback.data.split(":", 1)[1])
+    row = get_order(order_id)
+    if not row:
+        await callback.answer("Заказ уже удалён")
+        if callback.message:
+            await callback.message.edit_text("🗑 Заказ уже удалён")
+        return
+
+    await try_delete_channel_message(bot, row)
+    delete_order_record(order_id)
+    await callback.answer("Удалено")
+    if callback.message:
+        await callback.message.edit_text(f"🗑 Заказ №{order_id:06d} удалён из базы", parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data == "reset_orders_cancel")
+async def cb_reset_orders_cancel(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user.id if callback.from_user else None):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await callback.answer("Отменено")
+    if callback.message:
+        await callback.message.edit_text("Сброс заказов отменён.")
+
+
+@router.callback_query(F.data == "reset_orders_confirm")
+async def cb_reset_orders_confirm(callback: CallbackQuery, bot: Bot) -> None:
+    if not is_admin_user(callback.from_user.id if callback.from_user else None):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    rows = get_recent_orders(30)
+    # Если заказов больше 30, удаляем базу всё равно, но посты в канале Telegram
+    # бот сможет попытаться удалить только последние известные 30 за раз.
+    for row in rows:
+        await try_delete_channel_message(bot, row)
+
+    reset_orders_table()
+    await callback.answer("Сброшено")
+    if callback.message:
+        await callback.message.edit_text(
+            "✅ Все заказы удалены из базы. Нумерация сброшена.\n\n"
+            "Следующий заказ будет <b>№000001</b>.",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 @router.callback_query(F.data.startswith("publish:"))
@@ -686,9 +854,27 @@ async def email_watcher(bot: Bot) -> None:
         await asyncio.sleep(settings.email_check_interval)
 
 
+async def setup_bot_commands(bot: Bot) -> None:
+    # Обновляет список команд в меню Telegram. Иногда старое меню кэшируется,
+    # но команды всё равно работают при ручном вводе.
+    await bot.set_my_commands([
+        BotCommand(command="start", description="помощь и список команд"),
+        BotCommand(command="done", description="добавить выполненный заказ"),
+        BotCommand(command="orders", description="последние заказы"),
+        BotCommand(command="delete_order", description="удалить заказ по номеру"),
+        BotCommand(command="reset_orders", description="сбросить все заказы и нумерацию"),
+        BotCommand(command="checkmail", description="проверить почту сейчас"),
+        BotCommand(command="drafts", description="черновики из почты"),
+        BotCommand(command="stats", description="статистика"),
+        BotCommand(command="version", description="проверка версии"),
+    ])
+
+
 async def main() -> None:
     init_db()
     bot = Bot(settings.bot_token)
+    await setup_bot_commands(bot)
+    print(f"Starting OrderDone Bot {BUILD_VERSION}, db={settings.db_path}, email_enabled={settings.email_enabled}", flush=True)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
