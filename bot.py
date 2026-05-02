@@ -1,19 +1,22 @@
 import asyncio
+import base64
 import csv
+import hashlib
 import html
 import imaplib
 import inspect
 import os
-import random
 import re
 import sqlite3
+import tempfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from email import message_from_bytes
-from email.message import EmailMessage
+from email.message import Message as EmailMessage
 from email.policy import default
 from functools import wraps
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
@@ -21,12 +24,20 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
 load_dotenv()
 
-BUILD_VERSION = "crm-v4-2026-05-02"
+BUILD_VERSION = "saas-v1-2026-05-02"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -36,1405 +47,1406 @@ def env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "да", "on"}
 
 
-def parse_admin_ids(raw: str) -> set[int]:
-    ids: set[int] = set()
-    for part in raw.split(","):
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def parse_ids(raw: str) -> set[int]:
+    result: set[int] = set()
+    for part in (raw or "").replace(";", ",").split(","):
         part = part.strip()
         if not part:
             continue
         try:
-            ids.add(int(part))
-        except ValueError as exc:
-            raise RuntimeError(f"ADMIN_IDS содержит некорректный ID: {part}") from exc
-    return ids
+            result.add(int(part))
+        except ValueError:
+            pass
+    return result
 
 
-def split_csv(raw: str) -> list[str]:
-    return [item.strip() for item in raw.split(",") if item.strip()]
+def split_csv(raw: str, default: Optional[list[str]] = None) -> list[str]:
+    if not raw:
+        return default or []
+    return [x.strip() for x in raw.split(",") if x.strip()]
 
 
-@dataclass(frozen=True)
-class Settings:
-    bot_token: str
-    channel_id: str
-    admin_ids: set[int]
-    contact_url: str
-    contact_button_text: str
-    default_currency: str
-    db_path: str
-    auto_publish: bool
-    manual_preview: bool
-    email_enabled: bool
-    imap_host: str
-    imap_port: int
-    imap_user: str
-    imap_password: str
-    imap_folder: str
-    email_check_interval: int
-    email_skip_old_on_first_run: bool
-    kwork_sender_filter: str
-    kwork_success_keywords: list[str]
-    kwork_ignore_keywords: list[str]
-    allow_all_users: bool
-    categories: list[str]
+def now_utc() -> datetime:
+    return datetime.utcnow().replace(microsecond=0)
 
 
-def load_settings() -> Settings:
-    bot_token = os.getenv("BOT_TOKEN", "").strip()
-    channel_id = os.getenv("CHANNEL_ID", "").strip()
-    if not bot_token:
-        raise RuntimeError("Не указан BOT_TOKEN в .env / Railway Variables")
-    if not channel_id:
-        raise RuntimeError("Не указан CHANNEL_ID в .env / Railway Variables")
-
-    categories = split_csv(
-        os.getenv(
-            "ORDER_CATEGORIES",
-            "Telegram-боты,Парсеры,Автоматизация,GPT-боты,Сайты,Доработки,Другое",
-        )
-    )
-    if not categories:
-        categories = ["Другое"]
-
-    return Settings(
-        bot_token=bot_token,
-        channel_id=channel_id,
-        admin_ids=parse_admin_ids(os.getenv("ADMIN_IDS", "").strip()),
-        contact_url=os.getenv("CONTACT_URL", "").strip(),
-        contact_button_text=os.getenv("CONTACT_BUTTON_TEXT", "Заказать разработку").strip() or "Заказать разработку",
-        default_currency=os.getenv("DEFAULT_CURRENCY", "₽").strip() or "₽",
-        db_path=os.getenv("DB_PATH", "data/orders.db").strip() or "data/orders.db",
-        auto_publish=env_bool("AUTO_PUBLISH", False),
-        manual_preview=env_bool("MANUAL_PREVIEW", True),
-        email_enabled=env_bool("EMAIL_ENABLED", False),
-        imap_host=os.getenv("IMAP_HOST", "imap.gmail.com").strip(),
-        imap_port=int(os.getenv("IMAP_PORT", "993").strip() or "993"),
-        imap_user=os.getenv("IMAP_USER", "").strip(),
-        imap_password=os.getenv("IMAP_PASSWORD", "").strip(),
-        imap_folder=os.getenv("IMAP_FOLDER", "INBOX").strip() or "INBOX",
-        email_check_interval=max(15, int(os.getenv("EMAIL_CHECK_INTERVAL", "60").strip() or "60")),
-        email_skip_old_on_first_run=env_bool("EMAIL_SKIP_OLD_ON_FIRST_RUN", True),
-        kwork_sender_filter=os.getenv("KWORK_SENDER_FILTER", "kwork").strip().lower(),
-        kwork_success_keywords=[x.lower() for x in split_csv(os.getenv(
-            "KWORK_SUCCESS_KEYWORDS",
-            "заказ выполнен,заказ закрыт,работа выполнена,заказ завершен,работа принята,оплата зачислена,order completed,completed",
-        ))],
-        kwork_ignore_keywords=[x.lower() for x in split_csv(os.getenv(
-            "KWORK_IGNORE_KEYWORDS",
-            "новый заказ,заказ отменен,доработка,арбитраж,просрочен,сообщение от покупателя",
-        ))],
-        allow_all_users=env_bool("ALLOW_ALL_USERS", False),
-        categories=categories,
-    )
+def iso(dt: Optional[datetime] = None) -> str:
+    return (dt or now_utc()).isoformat()
 
 
-settings = load_settings()
-router = Router()
+def parse_dt(raw: Optional[str]) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
 
 
-class ManualOrder(StatesGroup):
-    waiting_amount = State()
-    waiting_title = State()
-    waiting_note = State()
+def fmt_date(raw: Optional[str]) -> str:
+    dt = parse_dt(raw)
+    if not dt:
+        return "—"
+    return dt.strftime("%d.%m.%Y")
 
 
-class EditOrder(StatesGroup):
-    waiting_amount = State()
-    waiting_title = State()
-    waiting_note = State()
-    waiting_category = State()
-
-
-# ========================
-# Base helpers
-# ========================
-
-def now_iso() -> str:
-    return datetime.now().replace(microsecond=0).isoformat()
-
-
-def today_ru() -> str:
-    return datetime.now().strftime("%d.%m.%Y")
-
-
-def current_month_key() -> str:
-    return datetime.now().strftime("%Y-%m")
-
-
-def current_month_ru() -> str:
-    months = {
-        "01": "январь", "02": "февраль", "03": "март", "04": "апрель",
-        "05": "май", "06": "июнь", "07": "июль", "08": "август",
-        "09": "сентябрь", "10": "октябрь", "11": "ноябрь", "12": "декабрь",
-    }
-    return f"{months[datetime.now().strftime('%m')]} {datetime.now().strftime('%Y')}"
-
-
-def db_connect() -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(settings.db_path) or ".", exist_ok=True)
-    con = sqlite3.connect(settings.db_path)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def ensure_column(con: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    columns = {row["name"] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
-    if column not in columns:
-        con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-
-def init_db() -> None:
-    with db_connect() as con:
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source TEXT NOT NULL DEFAULT 'manual',
-                source_uid TEXT UNIQUE,
-                amount INTEGER NOT NULL DEFAULT 0,
-                currency TEXT NOT NULL DEFAULT '₽',
-                title TEXT NOT NULL,
-                category TEXT,
-                note TEXT,
-                raw_subject TEXT,
-                raw_from TEXT,
-                status TEXT NOT NULL DEFAULT 'draft',
-                created_at TEXT NOT NULL,
-                published_at TEXT,
-                channel_message_id INTEGER
-            )
-            """
-        )
-        ensure_column(con, "orders", "category", "TEXT")
-        ensure_column(con, "orders", "channel_message_id", "INTEGER")
-        ensure_column(con, "orders", "published_at", "TEXT")
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS app_state (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
-        con.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_orders_published_at ON orders(published_at)")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_orders_category ON orders(category)")
-
-
-def get_state(key: str) -> Optional[str]:
-    with db_connect() as con:
-        row = con.execute("SELECT value FROM app_state WHERE key = ?", (key,)).fetchone()
-        return str(row["value"]) if row else None
-
-
-def set_state(key: str, value: str) -> None:
-    with db_connect() as con:
-        con.execute(
-            "INSERT INTO app_state(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value),
-        )
-
-
-def delete_state(key: str) -> None:
-    with db_connect() as con:
-        con.execute("DELETE FROM app_state WHERE key = ?", (key,))
-
-
-def is_admin_user(user_id: Optional[int]) -> bool:
-    if not user_id:
-        return False
-    if settings.allow_all_users:
-        return True
-    return user_id in settings.admin_ids
-
-
-def access_denied_text(user_id: Optional[int]) -> str:
-    if not settings.admin_ids and not settings.allow_all_users:
-        return (
-            "🔒 Доступ закрыт. Бот работает только для владельца.\n\n"
-            "В Railway → Variables укажи свой Telegram ID:\n"
-            f"<code>ADMIN_IDS={user_id or 'ТВОЙ_ID'}</code>\n\n"
-            "После этого сделай redeploy/restart."
-        )
-    return "🔒 Нет доступа."
-
-
-def only_admin(handler):
-    handler_signature = inspect.signature(handler)
-    allowed_kwargs = set(handler_signature.parameters.keys())
-
-    @wraps(handler)
-    async def wrapper(message: Message, *args, **kwargs):
-        user_id = message.from_user.id if message.from_user else None
-        if not is_admin_user(user_id):
-            await message.answer(access_denied_text(user_id), parse_mode=ParseMode.HTML)
-            return
-        filtered_kwargs = {key: value for key, value in kwargs.items() if key in allowed_kwargs}
-        return await handler(message, *args, **filtered_kwargs)
-
-    return wrapper
-
-
-def format_money(amount: int, currency: str | None = None) -> str:
-    currency = currency or settings.default_currency
+def rub(amount: int, currency: str = "₽") -> str:
     return f"{amount:,}".replace(",", " ") + f" {currency}"
 
 
-def normalize_amount(raw: str) -> int:
+def money_to_int(raw: str) -> int:
     cleaned = re.sub(r"[^0-9]", "", raw or "")
-    if not cleaned:
-        return 0
-    return int(cleaned)
+    return int(cleaned) if cleaned else 0
 
 
-def clean_title(title: str) -> str:
-    title = re.sub(r"\s+", " ", title or "").strip()
-    title = re.sub(r"^(re|fw|fwd):\s*", "", title, flags=re.I)
-    title = re.sub(r"\b(kwork|кворк)\b", "", title, flags=re.I).strip(" -—|:")
-    return title[:160] or "Заказ на Kwork"
+def month_key(dt: Optional[datetime] = None) -> str:
+    return (dt or now_utc()).strftime("%Y-%m")
 
 
-def clean_category(category: str | None) -> str:
-    category = re.sub(r"\s+", " ", category or "").strip()
-    return category[:60] if category else "Другое"
+OWNER_IDS = parse_ids(os.getenv("OWNER_IDS", "")) | parse_ids(os.getenv("ADMIN_IDS", ""))
+PUBLIC_MODE = env_bool("PUBLIC_MODE", True)
+DB_PATH = os.getenv("DB_PATH", "data/orders.db")
+TRIAL_DAYS = env_int("TRIAL_DAYS", 7)
+DEFAULT_PLAN = os.getenv("DEFAULT_PLAN", "trial")
+PLANS = split_csv(os.getenv("PLANS", "trial,starter,pro,business"))
+PLAN_PRICES_RAW = os.getenv("PLAN_PRICES", "starter=299,pro=599,business=999")
+SUBSCRIPTION_CONTACT_URL = os.getenv("SUBSCRIPTION_CONTACT_URL", "")
+DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "₽")
+DEFAULT_CONTACT_BUTTON_TEXT = os.getenv("DEFAULT_CONTACT_BUTTON_TEXT", "Заказать так же")
+DEFAULT_CATEGORIES = split_csv(
+    os.getenv("DEFAULT_ORDER_CATEGORIES", "Telegram-боты,Парсеры,Автоматизация,GPT-боты,Сайты,Доработки,Другое")
+)
+EMAIL_CHECK_INTERVAL = env_int("EMAIL_CHECK_INTERVAL", 60)
+EMAIL_MAX_PER_USER = env_int("EMAIL_MAX_PER_USER", 10)
+EMAIL_SKIP_OLD_ON_FIRST_RUN = env_bool("EMAIL_SKIP_OLD_ON_FIRST_RUN", True)
+DEFAULT_IMAP_HOST = os.getenv("DEFAULT_IMAP_HOST", "imap.gmail.com")
+DEFAULT_IMAP_PORT = env_int("DEFAULT_IMAP_PORT", 993)
+DEFAULT_IMAP_FOLDER = os.getenv("DEFAULT_IMAP_FOLDER", "INBOX")
+DEFAULT_KWORK_SENDER_FILTER = os.getenv("DEFAULT_KWORK_SENDER_FILTER", "kwork")
+SUCCESS_KEYWORDS = split_csv(os.getenv("KWORK_SUCCESS_KEYWORDS", "заказ выполнен,заказ завершен,работа принята"))
+IGNORE_KEYWORDS = split_csv(os.getenv("KWORK_IGNORE_KEYWORDS", "новый заказ,заказ отменен,доработка"))
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is empty. Add BOT_TOKEN to Railway Variables or .env")
+
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 
-def detect_category(title: str, body: str = "") -> str:
-    text = f"{title}\n{body}".lower()
-    rules = [
-        ("Telegram-боты", ["telegram", "телеграм", "тг", "бот", "bot", "aiogram"]),
-        ("GPT-боты", ["gpt", "chatgpt", "openai", "нейро", "ии", "ai бот", "ассистент"]),
-        ("Парсеры", ["парсер", "парсинг", "parser", "scraping", "скрап"]),
-        ("Автоматизация", ["автомат", "автоматизация", "интеграция", "api", "скрипт"]),
-        ("Сайты", ["сайт", "лендинг", "web", "frontend", "backend", "веб"]),
-        ("Доработки", ["доработ", "исправ", "фикс", "правк", "bug", "ошибк"]),
-    ]
-    configured_lower = {c.lower(): c for c in settings.categories}
-    for category, keywords in rules:
-        if category.lower() in configured_lower and any(k in text for k in keywords):
-            return configured_lower[category.lower()]
-    return settings.categories[0] if settings.categories else "Другое"
+# -------------------- encryption --------------------
+
+def get_fernet() -> Fernet:
+    key = os.getenv("DATA_SECRET_KEY", "").strip()
+    if not key:
+        key_path = Path("data/secret.key")
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+        if key_path.exists():
+            key = key_path.read_text().strip()
+        else:
+            key = Fernet.generate_key().decode()
+            key_path.write_text(key)
+    return Fernet(key.encode() if isinstance(key, str) else key)
 
 
-# ========================
-# DB helpers
-# ========================
+FERNET = get_fernet()
 
-def insert_order(
-    *,
-    source: str,
-    source_uid: Optional[str],
-    amount: int,
-    title: str,
-    category: Optional[str] = None,
-    note: Optional[str] = None,
-    currency: Optional[str] = None,
-    raw_subject: Optional[str] = None,
-    raw_from: Optional[str] = None,
-    status: str = "draft",
-) -> Optional[int]:
-    try:
-        with db_connect() as con:
-            cur = con.execute(
+
+def encrypt_secret(value: str) -> str:
+    return FERNET.encrypt(value.encode()).decode()
+
+
+def decrypt_secret(value: str) -> str:
+    return FERNET.decrypt(value.encode()).decode()
+
+
+# -------------------- database --------------------
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with db() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                tg_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                created_at TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                is_blocked INTEGER NOT NULL DEFAULT 0,
+                plan TEXT NOT NULL DEFAULT 'trial',
+                trial_until TEXT,
+                paid_until TEXT,
+                monthly_goal INTEGER NOT NULL DEFAULT 0,
+                channel_id TEXT,
+                contact_url TEXT,
+                contact_button_text TEXT NOT NULL DEFAULT 'Заказать так же',
+                currency TEXT NOT NULL DEFAULT '₽',
+                auto_publish INTEGER NOT NULL DEFAULT 0,
+                manual_preview INTEGER NOT NULL DEFAULT 1,
+                categories TEXT,
+                imap_host TEXT,
+                imap_port INTEGER,
+                imap_user TEXT,
+                imap_password_enc TEXT,
+                imap_folder TEXT,
+                email_enabled INTEGER NOT NULL DEFAULT 0,
+                email_skip_old INTEGER NOT NULL DEFAULT 1,
+                mail_initialized INTEGER NOT NULL DEFAULT 0,
+                sender_filter TEXT,
+                success_keywords TEXT,
+                ignore_keywords TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                public_number INTEGER NOT NULL,
+                source TEXT NOT NULL DEFAULT 'manual',
+                amount INTEGER NOT NULL DEFAULT 0,
+                currency TEXT NOT NULL DEFAULT '₽',
+                service TEXT NOT NULL DEFAULT 'Заказ',
+                category TEXT NOT NULL DEFAULT 'Другое',
+                comment TEXT,
+                status TEXT NOT NULL DEFAULT 'draft',
+                channel_id TEXT,
+                channel_message_id INTEGER,
+                email_uid TEXT,
+                email_subject TEXT,
+                dedupe_key TEXT,
+                created_at TEXT NOT NULL,
+                published_at TEXT,
+                skipped_at TEXT,
+                deleted_at TEXT,
+                UNIQUE(user_id, dedupe_key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_emails (
+                user_id INTEGER NOT NULL,
+                mailbox TEXT NOT NULL,
+                uid TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, mailbox, uid)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS subscription_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                admin_id INTEGER,
+                action TEXT NOT NULL,
+                days INTEGER,
+                plan TEXT,
+                note TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def plan_prices() -> dict[str, int]:
+    result: dict[str, int] = {}
+    for item in split_csv(PLAN_PRICES_RAW):
+        if "=" not in item:
+            continue
+        name, price = item.split("=", 1)
+        result[name.strip()] = money_to_int(price)
+    return result
+
+
+def ensure_user(message_or_user: Any) -> sqlite3.Row:
+    user = getattr(message_or_user, "from_user", message_or_user)
+    tg_id = int(user.id)
+    username = getattr(user, "username", None)
+    first_name = getattr(user, "first_name", None)
+    is_owner = tg_id in OWNER_IDS
+    with db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+        if row is None:
+            trial_until = None if is_owner else iso(now_utc() + timedelta(days=TRIAL_DAYS))
+            conn.execute(
                 """
-                INSERT INTO orders(source, source_uid, amount, currency, title, category, note, raw_subject, raw_from, status, created_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO users (
+                    tg_id, username, first_name, created_at, role, plan, trial_until,
+                    contact_button_text, currency, auto_publish, manual_preview, categories,
+                    imap_host, imap_port, imap_folder, email_skip_old, sender_filter,
+                    success_keywords, ignore_keywords, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    source,
-                    source_uid,
-                    int(amount or 0),
-                    currency or settings.default_currency,
-                    clean_title(title),
-                    clean_category(category or detect_category(title or "")),
-                    (note or "").strip() or None,
-                    raw_subject,
-                    raw_from,
-                    status,
-                    now_iso(),
+                    tg_id,
+                    username,
+                    first_name,
+                    iso(),
+                    "owner" if is_owner else "user",
+                    "owner" if is_owner else DEFAULT_PLAN,
+                    trial_until,
+                    DEFAULT_CONTACT_BUTTON_TEXT,
+                    DEFAULT_CURRENCY,
+                    1 if env_bool("DEFAULT_AUTO_PUBLISH", False) else 0,
+                    1 if env_bool("DEFAULT_MANUAL_PREVIEW", True) else 0,
+                    ",".join(DEFAULT_CATEGORIES),
+                    DEFAULT_IMAP_HOST,
+                    DEFAULT_IMAP_PORT,
+                    DEFAULT_IMAP_FOLDER,
+                    1 if EMAIL_SKIP_OLD_ON_FIRST_RUN else 0,
+                    DEFAULT_KWORK_SENDER_FILTER,
+                    ",".join(SUCCESS_KEYWORDS),
+                    ",".join(IGNORE_KEYWORDS),
+                    iso(),
                 ),
             )
-            return int(cur.lastrowid)
-    except sqlite3.IntegrityError:
-        return None
+            conn.commit()
+            row = conn.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+        else:
+            conn.execute(
+                "UPDATE users SET username=?, first_name=?, updated_at=? WHERE tg_id=?",
+                (username, first_name, iso(), tg_id),
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+    return row
 
 
-def update_order(order_id: int, **fields) -> bool:
-    allowed = {"amount", "currency", "title", "category", "note", "status", "published_at", "channel_message_id"}
-    updates = {k: v for k, v in fields.items() if k in allowed}
-    if not updates:
+def get_user(tg_id: int) -> Optional[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+
+
+def user_is_owner(tg_id: int) -> bool:
+    return tg_id in OWNER_IDS or (get_user(tg_id) and get_user(tg_id)["role"] == "owner")
+
+
+def is_sub_active(row: sqlite3.Row) -> bool:
+    if row["tg_id"] in OWNER_IDS or row["role"] == "owner":
+        return True
+    if row["is_blocked"]:
         return False
-    set_clause = ", ".join([f"{k} = ?" for k in updates])
-    values = list(updates.values()) + [order_id]
-    with db_connect() as con:
-        cur = con.execute(f"UPDATE orders SET {set_clause} WHERE id = ?", values)
-        return cur.rowcount > 0
+    current = now_utc()
+    trial_until = parse_dt(row["trial_until"])
+    paid_until = parse_dt(row["paid_until"])
+    return bool((trial_until and trial_until >= current) or (paid_until and paid_until >= current))
 
 
-def get_order(order_id: int) -> Optional[sqlite3.Row]:
-    with db_connect() as con:
-        return con.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-
-
-def get_recent_orders(limit: int = 10) -> list[sqlite3.Row]:
-    with db_connect() as con:
-        return con.execute(
-            "SELECT * FROM orders ORDER BY id DESC LIMIT ?",
-            (max(1, min(int(limit), 30)),),
-        ).fetchall()
-
-
-def reset_orders_table() -> None:
-    with db_connect() as con:
-        con.execute("DELETE FROM orders")
-        con.execute("DELETE FROM sqlite_sequence WHERE name = 'orders'")
-
-
-def delete_order_record(order_id: int) -> bool:
-    with db_connect() as con:
-        cur = con.execute("DELETE FROM orders WHERE id = ?", (order_id,))
-        return cur.rowcount > 0
-
-
-# ========================
-# Rendering / keyboards
-# ========================
-
-def public_order_keyboard() -> InlineKeyboardMarkup | None:
-    if not settings.contact_url:
-        return None
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=settings.contact_button_text, url=settings.contact_url)]]
-    )
-
-
-def draft_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish:{order_id}"),
-                InlineKeyboardButton(text="🗑 Пропустить", callback_data=f"skip:{order_id}"),
-            ],
-            [
-                InlineKeyboardButton(text="💰 Сумма", callback_data=f"edit_amount:{order_id}"),
-                InlineKeyboardButton(text="🧩 Услуга", callback_data=f"edit_title:{order_id}"),
-            ],
-            [
-                InlineKeyboardButton(text="🏷 Категория", callback_data=f"edit_category:{order_id}"),
-                InlineKeyboardButton(text="💬 Комментарий", callback_data=f"edit_note:{order_id}"),
-            ],
-            [InlineKeyboardButton(text="❌ Удалить из базы", callback_data=f"delete:{order_id}")],
-        ]
-    )
-
-
-def category_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    current: list[InlineKeyboardButton] = []
-    for idx, category in enumerate(settings.categories):
-        current.append(InlineKeyboardButton(text=category, callback_data=f"set_category:{order_id}:{idx}"))
-        if len(current) == 2:
-            rows.append(current)
-            current = []
-    if current:
-        rows.append(current)
-    rows.append([InlineKeyboardButton(text="✍️ Ввести свою", callback_data=f"custom_category:{order_id}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"preview:{order_id}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def build_post_text(order: sqlite3.Row | dict) -> str:
-    title = html.escape(str(order["title"]))
-    category = html.escape(str(order["category"] or "Другое"))
-    note = html.escape(str(order["note"] or ""))
-    amount = int(order["amount"] or 0)
-    currency = str(order["currency"] or settings.default_currency)
-    order_id = int(order["id"])
-
-    # Лёгкая вариативность для канала: текст выглядит живее, но структура всегда понятная.
-    headers = [
-        "✅ <b>ЗАКАЗ ВЫПОЛНЕН</b>",
-        "🚀 <b>НОВЫЙ ЗАВЕРШЁННЫЙ ПРОЕКТ</b>",
-        "🔥 <b>РАБОТА СДАНА</b>",
+def subscription_text(row: sqlite3.Row) -> str:
+    active = is_sub_active(row)
+    trial_until = parse_dt(row["trial_until"])
+    paid_until = parse_dt(row["paid_until"])
+    lines = [
+        f"План: <b>{html.escape(row['plan'] or 'free')}</b>",
+        f"Статус: {'✅ активна' if active else '❌ не активна'}",
     ]
-    header = headers[(order_id - 1) % len(headers)]
-
-    lines = [header, ""]
-    if amount > 0:
-        lines.append(f"💰 <b>Сумма:</b> {format_money(amount, currency)}")
-    else:
-        lines.append("💰 <b>Сумма:</b> не указана")
-    lines.extend(
-        [
-            f"🧩 <b>Услуга:</b> {title}",
-            f"🏷 <b>Категория:</b> {category}",
-            f"📅 <b>Дата:</b> {today_ru()}",
-            f"🔢 <b>Заказ №:</b> {order_id:06d}",
-        ]
-    )
-    if note:
-        lines.extend(["", f"💬 {note}"])
-    lines.extend(["", "Спасибо за доверие 🙌"])
+    if trial_until:
+        lines.append(f"Trial до: <b>{trial_until.strftime('%d.%m.%Y')}</b>")
+    if paid_until:
+        lines.append(f"Оплачено до: <b>{paid_until.strftime('%d.%m.%Y')}</b>")
+    if row["tg_id"] in OWNER_IDS:
+        lines.append("Ты владелец, подписка не требуется.")
     return "\n".join(lines)
 
 
-def build_draft_preview(row: sqlite3.Row) -> str:
-    return (
-        "📝 <b>Предпросмотр заказа</b>\n"
-        "Можешь сразу опубликовать или поправить поля кнопками ниже.\n\n"
-        + build_post_text(row)
+def next_public_number(user_id: int) -> int:
+    with db() as conn:
+        row = conn.execute("SELECT COALESCE(MAX(public_number), 0) + 1 AS n FROM orders WHERE user_id=?", (user_id,)).fetchone()
+        return int(row["n"])
+
+
+def create_order(
+    user_id: int,
+    amount: int,
+    service: str,
+    category: str = "Другое",
+    comment: str = "",
+    source: str = "manual",
+    status: str = "draft",
+    email_uid: Optional[str] = None,
+    email_subject: Optional[str] = None,
+    dedupe_key: Optional[str] = None,
+) -> sqlite3.Row:
+    user = get_user(user_id)
+    currency = user["currency"] if user else DEFAULT_CURRENCY
+    if not dedupe_key:
+        base = f"{user_id}:{amount}:{service}:{category}:{comment}:{source}:{email_uid}:{email_subject}"
+        dedupe_key = hashlib.sha256(base.encode()).hexdigest()[:32]
+    with db() as conn:
+        n = next_public_number(user_id)
+        try:
+            conn.execute(
+                """
+                INSERT INTO orders (
+                    user_id, public_number, source, amount, currency, service, category,
+                    comment, status, email_uid, email_subject, dedupe_key, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, n, source, amount, currency, service, category, comment, status, email_uid, email_subject, dedupe_key, iso()),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            existing = conn.execute("SELECT * FROM orders WHERE user_id=? AND dedupe_key=?", (user_id, dedupe_key)).fetchone()
+            if existing:
+                return existing
+            raise
+        return conn.execute("SELECT * FROM orders WHERE user_id=? AND dedupe_key=?", (user_id, dedupe_key)).fetchone()
+
+
+def get_order(order_id: int) -> Optional[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+
+
+def update_order(order_id: int, **fields: Any) -> None:
+    if not fields:
+        return
+    keys = list(fields.keys())
+    values = [fields[k] for k in keys]
+    sql = ", ".join([f"{k}=?" for k in keys])
+    with db() as conn:
+        conn.execute(f"UPDATE orders SET {sql} WHERE id=?", (*values, order_id))
+        conn.commit()
+
+
+# -------------------- Telegram UI --------------------
+router = Router()
+
+
+class EditOrderState(StatesGroup):
+    waiting_value = State()
+
+
+class SetupState(StatesGroup):
+    waiting_channel = State()
+    waiting_contact = State()
+    waiting_email = State()
+
+
+def safe_handler(fn):
+    @wraps(fn)
+    async def wrapper(*args, **kwargs):
+        sig = inspect.signature(fn)
+        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return await fn(*args, **filtered)
+    return wrapper
+
+
+def private_access(fn):
+    @wraps(fn)
+    async def wrapper(event: Message | CallbackQuery, *args, **kwargs):
+        from_user = event.from_user
+        row = ensure_user(from_user)
+        if row["is_blocked"]:
+            if isinstance(event, CallbackQuery):
+                await event.answer("Доступ заблокирован", show_alert=True)
+            else:
+                await event.answer("🔒 Доступ заблокирован.")
+            return None
+        if not PUBLIC_MODE and from_user.id not in OWNER_IDS:
+            if isinstance(event, CallbackQuery):
+                await event.answer("Нет доступа", show_alert=True)
+            else:
+                await event.answer("🔒 Нет доступа.")
+            return None
+        return await fn(event, *args, **kwargs)
+    return safe_handler(wrapper)
+
+
+def active_required(fn):
+    @wraps(fn)
+    async def wrapper(event: Message | CallbackQuery, *args, **kwargs):
+        row = ensure_user(event.from_user)
+        if not is_sub_active(row):
+            text = (
+                "❌ Подписка не активна.\n\n"
+                f"{subscription_text(row)}\n\n"
+                "Команда /plans покажет тарифы и способ подключения."
+            )
+            if isinstance(event, CallbackQuery):
+                await event.answer("Подписка не активна", show_alert=True)
+                await event.message.answer(text, parse_mode=ParseMode.HTML)
+            else:
+                await event.answer(text, parse_mode=ParseMode.HTML)
+            return None
+        return await fn(event, *args, **kwargs)
+    return private_access(wrapper)
+
+
+def owner_required(fn):
+    @wraps(fn)
+    async def wrapper(event: Message | CallbackQuery, *args, **kwargs):
+        if event.from_user.id not in OWNER_IDS:
+            if isinstance(event, CallbackQuery):
+                await event.answer("Только владелец", show_alert=True)
+            else:
+                await event.answer("🔒 Команда только для владельца бота.")
+            return None
+        return await fn(event, *args, **kwargs)
+    return private_access(wrapper)
+
+
+def post_keyboard(row: sqlite3.Row) -> Optional[InlineKeyboardMarkup]:
+    user = get_user(row["user_id"])
+    url = user["contact_url"] if user else None
+    if not url:
+        return None
+    text = user["contact_button_text"] if user else DEFAULT_CONTACT_BUTTON_TEXT
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=text, url=url)]])
+
+
+def preview_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"pub:{order_id}"),
+                InlineKeyboardButton(text="🚫 Пропустить", callback_data=f"skip:{order_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="💰 Сумма", callback_data=f"edit:amount:{order_id}"),
+                InlineKeyboardButton(text="🧩 Услуга", callback_data=f"edit:service:{order_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="🏷 Категория", callback_data=f"edit:category:{order_id}"),
+                InlineKeyboardButton(text="📝 Комментарий", callback_data=f"edit:comment:{order_id}"),
+            ],
+        ]
     )
 
 
-async def send_draft_preview(bot: Bot, chat_id: int, order_id: int, intro: str | None = None) -> None:
+def render_post(row: sqlite3.Row) -> str:
+    service = html.escape(row["service"] or "Заказ")
+    category = html.escape(row["category"] or "Другое")
+    comment = html.escape(row["comment"] or "")
+    date = datetime.fromisoformat(row["created_at"]).strftime("%d.%m.%Y") if row["created_at"] else now_utc().strftime("%d.%m.%Y")
+    lines = [
+        "✅ <b>ЗАКАЗ ВЫПОЛНЕН</b>",
+        "",
+        f"💰 <b>Сумма:</b> {rub(int(row['amount']), row['currency'])}",
+        f"🧩 <b>Услуга:</b> {service}",
+        f"🏷 <b>Категория:</b> {category}",
+        f"📅 <b>Дата:</b> {date}",
+        f"🔢 <b>Заказ №:</b> {int(row['public_number']):06d}",
+    ]
+    if comment:
+        lines += ["", f"📝 {comment}"]
+    lines += ["", "Спасибо за доверие 🙌"]
+    return "\n".join(lines)
+
+
+def render_preview(row: sqlite3.Row) -> str:
+    return "<b>Предпросмотр поста</b>\n\n" + render_post(row)
+
+
+async def publish_order(bot: Bot, order_id: int, notify_user: bool = True) -> tuple[bool, str]:
     row = get_order(order_id)
     if not row:
-        await bot.send_message(chat_id, "Заказ не найден.")
+        return False, "Заказ не найден."
+    user = get_user(row["user_id"])
+    if not user:
+        return False, "Пользователь не найден."
+    if int(row["amount"] or 0) <= 0:
+        return False, "Сумма заказа не распознана. Нажми «Сумма» в предпросмотре и укажи её вручную."
+    if not user["channel_id"]:
+        return False, "Сначала укажи канал командой /set_channel @channel"
+    if not is_sub_active(user):
+        return False, "Подписка не активна."
+    try:
+        msg = await bot.send_message(
+            chat_id=user["channel_id"],
+            text=render_post(row),
+            parse_mode=ParseMode.HTML,
+            reply_markup=post_keyboard(row),
+            disable_web_page_preview=True,
+        )
+        update_order(
+            order_id,
+            status="published",
+            channel_id=str(user["channel_id"]),
+            channel_message_id=msg.message_id,
+            published_at=iso(),
+        )
+        if notify_user:
+            await bot.send_message(user["tg_id"], f"✅ Опубликовано: заказ №{int(row['public_number']):06d}")
+        return True, "Опубликовано."
+    except Exception as e:
+        return False, f"Не получилось опубликовать. Проверь, что бот админ канала. Ошибка: {e}"
+
+
+def parse_done_args(text: str) -> tuple[int, str, str]:
+    raw = text.strip()
+    if not raw:
+        return 0, "Заказ", ""
+    # /done 3000 | service | comment
+    parts = [p.strip() for p in raw.split("|")]
+    first = parts[0]
+    match = re.match(r"^(\d[\d\s.,]*)\s*(.*)$", first)
+    if match:
+        amount = money_to_int(match.group(1))
+        service = match.group(2).strip() or (parts[1] if len(parts) > 1 else "Заказ")
+    else:
+        amount = 0
+        service = first or "Заказ"
+    comment = ""
+    if len(parts) >= 2 and match and not match.group(2).strip():
+        service = parts[1] or service
+        comment = parts[2] if len(parts) >= 3 else ""
+    elif len(parts) >= 2:
+        comment = parts[1]
+    if len(parts) >= 3:
+        comment = parts[2]
+    return amount, service, comment
+
+
+async def set_bot_commands(bot: Bot) -> None:
+    commands = [
+        BotCommand(command="start", description="Запуск и меню"),
+        BotCommand(command="setup", description="Настройка канала, кнопки и почты"),
+        BotCommand(command="done", description="Создать выполненный заказ"),
+        BotCommand(command="stats", description="Статистика заработка"),
+        BotCommand(command="subscription", description="Моя подписка"),
+        BotCommand(command="plans", description="Тарифы"),
+        BotCommand(command="settings", description="Мои настройки"),
+        BotCommand(command="version", description="Версия бота"),
+    ]
+    await bot.set_my_commands(commands)
+
+
+@router.message(Command("start"))
+@private_access
+async def cmd_start(message: Message):
+    row = ensure_user(message)
+    text = (
+        f"👋 Привет! Это <b>Kwork Proof Bot</b>.\n\n"
+        "Я могу автоматически делать красивые посты о выполненных заказах в твой Telegram-канал, "
+        "вести статистику заработка и ловить письма Kwork о завершённых заказах.\n\n"
+        f"<b>Версия:</b> {BUILD_VERSION}\n\n"
+        f"{subscription_text(row)}\n\n"
+        "Главные команды:\n"
+        "/setup — быстрая настройка\n"
+        "/done 3000 | Telegram-бот | Комментарий — создать пост\n"
+        "/stats — заработок и заказы\n"
+        "/settings — текущие настройки\n"
+        "/plans — тарифы\n"
+    )
+    if message.from_user.id in OWNER_IDS:
+        text += "\nКоманды владельца: /grant, /revoke, /users, /app_stats"
+    await message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+@router.message(Command("version"))
+@private_access
+async def cmd_version(message: Message):
+    await message.answer(f"Версия: <b>{BUILD_VERSION}</b>", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("whoami"))
+@private_access
+async def cmd_whoami(message: Message):
+    await message.answer(f"Твой Telegram ID: <code>{message.from_user.id}</code>", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("setup"))
+@private_access
+async def cmd_setup(message: Message):
+    text = (
+        "⚙️ <b>Быстрая настройка</b>\n\n"
+        "1. Добавь бота админом в свой канал.\n"
+        "2. Укажи канал:\n"
+        "<code>/set_channel @your_channel</code>\n\n"
+        "3. Укажи кнопку под постами:\n"
+        "<code>/set_contact https://t.me/username Заказать так же</code>\n\n"
+        "4. Подключи почту Kwork через пароль приложения Gmail:\n"
+        "<code>/set_email your@gmail.com APP_PASSWORD</code>\n\n"
+        "5. Включи проверку почты:\n"
+        "<code>/enable_email</code>\n\n"
+        "Для ручного теста:\n"
+        "<code>/done 3000 | Telegram-бот | Сделан бот и инструкция</code>"
+    )
+    await message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+@router.message(Command("settings"))
+@private_access
+async def cmd_settings(message: Message):
+    row = ensure_user(message)
+    text = (
+        "⚙️ <b>Твои настройки</b>\n\n"
+        f"Канал: <code>{html.escape(str(row['channel_id'] or 'не указан'))}</code>\n"
+        f"Кнопка: <b>{html.escape(row['contact_button_text'] or DEFAULT_CONTACT_BUTTON_TEXT)}</b>\n"
+        f"Ссылка кнопки: <code>{html.escape(str(row['contact_url'] or 'не указана'))}</code>\n"
+        f"Валюта: <b>{html.escape(row['currency'] or DEFAULT_CURRENCY)}</b>\n"
+        f"Автопубликация почты: <b>{'да' if row['auto_publish'] else 'нет, сначала предпросмотр'}</b>\n"
+        f"Почта: <code>{html.escape(str(row['imap_user'] or 'не подключена'))}</code>\n"
+        f"Проверка почты: <b>{'включена' if row['email_enabled'] else 'выключена'}</b>\n"
+        f"Цель месяца: <b>{rub(int(row['monthly_goal']), row['currency']) if row['monthly_goal'] else 'не задана'}</b>\n\n"
+        f"{subscription_text(row)}"
+    )
+    await message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+@router.message(Command("set_channel"))
+@private_access
+async def cmd_set_channel(message: Message, command: CommandObject):
+    arg = (command.args or "").strip()
+    if not arg:
+        await message.answer("Пример: <code>/set_channel @my_channel</code>", parse_mode=ParseMode.HTML)
         return
-    text = (intro + "\n\n" if intro else "") + build_draft_preview(row)
-    await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=draft_keyboard(order_id))
+    with db() as conn:
+        conn.execute("UPDATE users SET channel_id=?, updated_at=? WHERE tg_id=?", (arg, iso(), message.from_user.id))
+        conn.commit()
+    await message.answer("✅ Канал сохранён. Проверь, что бот добавлен админом в этот канал.")
 
 
-async def edit_or_send_preview(callback: CallbackQuery, order_id: int, intro: str | None = None) -> None:
-    row = get_order(order_id)
-    if not row:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
-    text = (intro + "\n\n" if intro else "") + build_draft_preview(row)
-    if callback.message:
-        await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=draft_keyboard(order_id))
-    await callback.answer()
-
-
-async def try_delete_channel_message(bot: Bot, row: sqlite3.Row) -> None:
-    channel_message_id = row["channel_message_id"]
-    if not channel_message_id:
+@router.message(Command("test_channel"))
+@active_required
+async def cmd_test_channel(message: Message, bot: Bot):
+    row = ensure_user(message)
+    if not row["channel_id"]:
+        await message.answer("Сначала укажи канал: /set_channel @channel")
         return
     try:
-        await bot.delete_message(settings.channel_id, int(channel_message_id))
-    except Exception:
-        pass
+        await bot.send_message(row["channel_id"], "✅ Тест: бот успешно подключён к каналу.")
+        await message.answer("✅ Тестовое сообщение отправлено в канал.")
+    except Exception as e:
+        await message.answer(f"❌ Не получилось отправить. Проверь права админа. Ошибка: {e}")
 
 
-async def publish_order(bot: Bot, order_id: int) -> Optional[int]:
-    row = get_order(order_id)
-    if not row:
-        return None
-    if row["status"] == "published" and row["channel_message_id"]:
-        return int(row["channel_message_id"])
-
-    msg = await bot.send_message(
-        chat_id=settings.channel_id,
-        text=build_post_text(row),
-        parse_mode=ParseMode.HTML,
-        reply_markup=public_order_keyboard(),
-        disable_web_page_preview=True,
-    )
-    update_order(order_id, status="published", published_at=now_iso(), channel_message_id=msg.message_id)
-    return msg.message_id
-
-
-async def notify_admins(bot: Bot, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
-    if not settings.admin_ids:
-        return
-    for admin_id in settings.admin_ids:
-        try:
-            await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-        except Exception:
-            pass
-
-
-def parse_done_args(args: str) -> tuple[int, str, str, str]:
-    args = (args or "").strip()
+@router.message(Command("set_contact"))
+@private_access
+async def cmd_set_contact(message: Message, command: CommandObject):
+    args = (command.args or "").strip()
     if not args:
-        return 0, "", "", ""
-
-    # /done 3000 | название | комментарий | категория
-    if "|" in args:
-        parts = [p.strip() for p in args.split("|")]
-        amount = normalize_amount(parts[0]) if parts else 0
-        title = parts[1] if len(parts) > 1 else "Заказ"
-        note = parts[2] if len(parts) > 2 else ""
-        category = parts[3] if len(parts) > 3 else detect_category(title, note)
-        return amount, title, note, category
-
-    # /done 3000 Разработка Telegram-бота
-    match = re.match(r"^([\d\s.,]+)\s+(.+)$", args)
-    if match:
-        title = match.group(2).strip()
-        return normalize_amount(match.group(1)), title, "", detect_category(title)
-
-    return 0, args, "", detect_category(args)
+        await message.answer("Пример: <code>/set_contact https://t.me/username Заказать так же</code>", parse_mode=ParseMode.HTML)
+        return
+    parts = args.split(maxsplit=1)
+    url = parts[0].strip()
+    button = parts[1].strip() if len(parts) > 1 else DEFAULT_CONTACT_BUTTON_TEXT
+    if not (url.startswith("https://") or url.startswith("http://") or url.startswith("tg://")):
+        await message.answer("Ссылка должна начинаться с https://, http:// или tg://")
+        return
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET contact_url=?, contact_button_text=?, updated_at=? WHERE tg_id=?",
+            (url, button, iso(), message.from_user.id),
+        )
+        conn.commit()
+    await message.answer("✅ Кнопка под постами сохранена.")
 
 
-# ========================
-# Commands
-# ========================
-
-@router.message(Command("start", "help"))
-@only_admin
-async def cmd_start(message: Message) -> None:
-    mode = "полный автомат" if settings.auto_publish else "предпросмотр с подтверждением"
-    manual_mode = "предпросмотр" if settings.manual_preview else "сразу в канал"
-    email_status = "включена" if settings.email_enabled else "выключена"
-    await message.answer(
-        f"Привет. Я бот для автопостинга выполненных заказов в канал.\nВерсия: <b>{BUILD_VERSION}</b>\n\n"
-        f"Kwork-почта: <b>{html.escape(mode)}</b> · проверка: <b>{html.escape(email_status)}</b>\n"
-        f"Ручные заказы: <b>{html.escape(manual_mode)}</b>\n\n"
-        "Команды:\n"
-        "<code>/done 3000 Разработка Telegram-бота</code> — добавить заказ\n"
-        "<code>/done 3000 | Название | Комментарий | Категория</code> — добавить подробно\n"
-        "<code>/quickdone 3000 Название</code> — сразу опубликовать без предпросмотра\n"
-        "<code>/drafts</code> — черновики и предпросмотр\n"
-        "<code>/orders</code> — последние заказы\n"
-        "<code>/delete_order 2</code> или <code>/del 2</code> — удалить заказ\n"
-        "<code>/reset</code> — удалить все заказы и сбросить нумерацию\n\n"
-        "Статистика:\n"
-        "<code>/stats</code> или <code>/earnings</code> — заработок и цель месяца\n"
-        "<code>/months</code> — статистика по месяцам\n"
-        "<code>/categories</code> — статистика по категориям\n"
-        "<code>/goal 100000</code> — поставить цель на месяц\n"
-        "<code>/export</code> — выгрузить заказы в CSV\n"
-        "<code>/backup</code> — скачать базу SQLite\n\n"
-        "Сервис:\n"
-        "<code>/checkmail</code> — проверить почту сейчас\n"
-        "<code>/whoami</code> — показать Telegram ID\n"
-        "<code>/version</code> — проверить версию",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@router.message(Command("version", "health"))
-@only_admin
-async def cmd_version(message: Message) -> None:
-    await message.answer(
-        f"✅ Бот живой. Версия: <b>{BUILD_VERSION}</b>\n"
-        f"База: <code>{html.escape(settings.db_path)}</code>\n"
-        f"Почта: <b>{'включена' if settings.email_enabled else 'выключена'}</b>\n"
-        f"Защита: <b>{'выключена, доступ всем' if settings.allow_all_users else 'только ADMIN_IDS'}</b>\n"
-        f"Категории: <b>{html.escape(', '.join(settings.categories))}</b>",
-        parse_mode=ParseMode.HTML,
-    )
+@router.message(Command("set_email"))
+@private_access
+async def cmd_set_email(message: Message, command: CommandObject):
+    args = (command.args or "").strip()
+    if not args:
+        await message.answer(
+            "Пример для Gmail:\n"
+            "<code>/set_email your@gmail.com APP_PASSWORD</code>\n\n"
+            "Для кастомного IMAP:\n"
+            "<code>/set_email imap.mail.ru 993 user@mail.ru PASSWORD</code>\n\n"
+            "Пароль хранится в базе в зашифрованном виде. После отправки команды можешь удалить сообщение у себя.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    parts = args.split()
+    if len(parts) == 2:
+        host, port, email_user, password = DEFAULT_IMAP_HOST, DEFAULT_IMAP_PORT, parts[0], parts[1]
+    elif len(parts) >= 4:
+        host, port_raw, email_user, password = parts[0], parts[1], parts[2], " ".join(parts[3:])
+        try:
+            port = int(port_raw)
+        except ValueError:
+            await message.answer("IMAP port должен быть числом, обычно 993.")
+            return
+    else:
+        await message.answer("Не понял формат. Напиши /set_email без аргументов, покажу примеры.")
+        return
+    enc = encrypt_secret(password)
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE users SET imap_host=?, imap_port=?, imap_user=?, imap_password_enc=?,
+            imap_folder=?, email_enabled=0, mail_initialized=0, updated_at=? WHERE tg_id=?
+            """,
+            (host, port, email_user, enc, DEFAULT_IMAP_FOLDER, iso(), message.from_user.id),
+        )
+        conn.commit()
+    await message.answer("✅ Почта сохранена. Теперь напиши /enable_email, чтобы включить проверку.")
 
 
-@router.message(Command("whoami", "id"))
-async def cmd_whoami(message: Message) -> None:
-    user_id = message.from_user.id if message.from_user else None
-    await message.answer(
-        "Твой Telegram ID:\n"
-        f"<code>{user_id}</code>\n\n"
-        "Для защиты бота в Railway → Variables поставь:\n"
-        f"<code>ADMIN_IDS={user_id}</code>\n"
-        "<code>ALLOW_ALL_USERS=false</code>",
-        parse_mode=ParseMode.HTML,
-    )
+@router.message(Command("enable_email"))
+@active_required
+async def cmd_enable_email(message: Message):
+    row = ensure_user(message)
+    if not row["imap_user"] or not row["imap_password_enc"]:
+        await message.answer("Сначала подключи почту: /set_email your@gmail.com APP_PASSWORD")
+        return
+    with db() as conn:
+        conn.execute("UPDATE users SET email_enabled=1, updated_at=? WHERE tg_id=?", (iso(), message.from_user.id))
+        conn.commit()
+    await message.answer("✅ Проверка почты включена. Новые найденные завершённые заказы будут попадать в предпросмотр или автопубликацию.")
+
+
+@router.message(Command("disable_email"))
+@private_access
+async def cmd_disable_email(message: Message):
+    with db() as conn:
+        conn.execute("UPDATE users SET email_enabled=0, updated_at=? WHERE tg_id=?", (iso(), message.from_user.id))
+        conn.commit()
+    await message.answer("⏸ Проверка почты выключена.")
+
+
+@router.message(Command("autopublish"))
+@private_access
+async def cmd_autopublish(message: Message, command: CommandObject):
+    arg = (command.args or "").strip().lower()
+    if arg not in {"on", "off", "true", "false", "1", "0"}:
+        await message.answer("Пример: /autopublish on или /autopublish off")
+        return
+    value = arg in {"on", "true", "1"}
+    with db() as conn:
+        conn.execute("UPDATE users SET auto_publish=?, updated_at=? WHERE tg_id=?", (1 if value else 0, iso(), message.from_user.id))
+        conn.commit()
+    await message.answer(f"✅ Автопубликация: {'включена' if value else 'выключена, будет предпросмотр'}")
 
 
 @router.message(Command("done"))
-@only_admin
-async def cmd_done(message: Message, command: CommandObject, state: FSMContext, bot: Bot) -> None:
-    amount, title, note, category = parse_done_args(command.args or "")
-    if not command.args:
-        await state.set_state(ManualOrder.waiting_amount)
-        await message.answer("Введи сумму заказа, например: <code>3000</code>", parse_mode=ParseMode.HTML)
-        return
-
-    if not title:
-        await message.answer("Не понял название услуги. Пример: <code>/done 3000 Разработка Telegram-бота</code>", parse_mode=ParseMode.HTML)
-        return
-
-    order_id = insert_order(source="manual", source_uid=None, amount=amount, title=title, note=note, category=category, status="draft")
-    if not order_id:
-        await message.answer("Не смог создать заказ.")
-        return
-
-    if settings.manual_preview:
-        await send_draft_preview(bot, message.chat.id, order_id, "Создал черновик ✅")
-    else:
-        await publish_order(bot, order_id)
-        await message.answer("Готово, пост опубликован в канал ✅")
-
-
-@router.message(Command("quickdone", "qdone"))
-@only_admin
-async def cmd_quick_done(message: Message, command: CommandObject, bot: Bot) -> None:
-    amount, title, note, category = parse_done_args(command.args or "")
-    if not command.args or not title:
-        await message.answer("Пример: <code>/quickdone 3000 Разработка Telegram-бота</code>", parse_mode=ParseMode.HTML)
-        return
-    order_id = insert_order(source="manual", source_uid=None, amount=amount, title=title, note=note, category=category, status="draft")
-    if not order_id:
-        await message.answer("Не смог создать заказ.")
-        return
-    await publish_order(bot, order_id)
-    await message.answer("Готово, пост сразу опубликован в канал ✅")
-
-
-@router.message(ManualOrder.waiting_amount)
-@only_admin
-async def manual_amount(message: Message, state: FSMContext) -> None:
-    amount = normalize_amount(message.text or "")
+@active_required
+async def cmd_done(message: Message, command: CommandObject, bot: Bot):
+    row = ensure_user(message)
+    amount, service, comment = parse_done_args(command.args or "")
     if amount <= 0:
-        await message.answer("Сумма должна быть числом. Например: <code>3000</code>", parse_mode=ParseMode.HTML)
+        await message.answer("Пример: <code>/done 3000 | Telegram-бот | Сделан бот и инструкция</code>", parse_mode=ParseMode.HTML)
         return
-    await state.update_data(amount=amount)
-    await state.set_state(ManualOrder.waiting_title)
-    await message.answer("Теперь введи название услуги, например: <code>Разработка Telegram-бота</code>", parse_mode=ParseMode.HTML)
-
-
-@router.message(ManualOrder.waiting_title)
-@only_admin
-async def manual_title(message: Message, state: FSMContext) -> None:
-    title = clean_title(message.text or "")
-    await state.update_data(title=title)
-    await state.set_state(ManualOrder.waiting_note)
-    await message.answer("Комментарий к заказу. Можно написать <code>-</code>, если без комментария.", parse_mode=ParseMode.HTML)
-
-
-@router.message(ManualOrder.waiting_note)
-@only_admin
-async def manual_note(message: Message, state: FSMContext, bot: Bot) -> None:
-    data = await state.get_data()
-    note = (message.text or "").strip()
-    if note == "-":
-        note = ""
-    title = str(data["title"])
-    order_id = insert_order(
+    category = split_csv(row["categories"] or "")[:1]
+    order = create_order(
+        user_id=message.from_user.id,
+        amount=amount,
+        service=service,
+        category=category[0] if category else "Другое",
+        comment=comment,
         source="manual",
-        source_uid=None,
-        amount=int(data["amount"]),
-        title=title,
-        category=detect_category(title, note),
-        note=note,
-        status="draft",
+        status="draft" if row["manual_preview"] else "published",
     )
-    await state.clear()
-    if not order_id:
-        await message.answer("Не смог создать заказ.")
-        return
-    await send_draft_preview(bot, message.chat.id, order_id, "Черновик готов ✅")
+    if row["manual_preview"]:
+        await message.answer(render_preview(order), parse_mode=ParseMode.HTML, reply_markup=preview_keyboard(order["id"]))
+    else:
+        ok, result = await publish_order(bot, order["id"])
+        if not ok:
+            await message.answer(result)
 
 
-@router.message(Command("orders", "list"))
-@only_admin
-async def cmd_orders(message: Message) -> None:
-    rows = get_recent_orders(10)
-    if not rows:
-        await message.answer("Заказов пока нет. Нумерация начнётся с <b>№000001</b>.", parse_mode=ParseMode.HTML)
-        return
-
-    await message.answer(
-        "Последние заказы. Тестовый заказ можно удалить кнопкой ниже.\n\n"
-        "Для полного обнуления: <code>/reset</code>",
-        parse_mode=ParseMode.HTML,
-    )
-    for row in rows:
-        status = html.escape(str(row["status"]))
-        title = html.escape(str(row["title"]))
-        category = html.escape(str(row["category"] or "Другое"))
-        amount = format_money(int(row["amount"] or 0), str(row["currency"] or settings.default_currency))
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="👀 Открыть", callback_data=f"preview:{int(row['id'])}"),
-                    InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{int(row['id'])}"),
-                ]
-            ]
-        )
-        await message.answer(
-            f"🔢 <b>№{int(row['id']):06d}</b>\n"
-            f"Статус: <b>{status}</b>\n"
-            f"Сумма: <b>{html.escape(amount)}</b>\n"
-            f"Категория: <b>{category}</b>\n"
-            f"Услуга: {title}",
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-        )
-
-
-@router.message(Command("delete_order", "del", "delete"))
-@only_admin
-async def cmd_delete_order(message: Message, command: CommandObject, bot: Bot) -> None:
-    raw = (command.args or "").strip()
-    if not raw or not raw.isdigit():
-        await message.answer("Напиши номер заказа. Пример: <code>/delete_order 2</code>", parse_mode=ParseMode.HTML)
-        return
-
-    order_id = int(raw)
-    row = get_order(order_id)
-    if not row:
-        await message.answer(f"Заказ №{order_id:06d} не найден.")
-        return
-
-    await try_delete_channel_message(bot, row)
-    delete_order_record(order_id)
-    await message.answer(f"Удалил заказ №{order_id:06d} из базы ✅")
-
-
-@router.message(Command("reset_orders", "reset"))
-@only_admin
-async def cmd_reset_orders(message: Message) -> None:
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Да, удалить всё и сбросить №", callback_data="reset_orders_confirm")],
-            [InlineKeyboardButton(text="Отмена", callback_data="reset_orders_cancel")],
-        ]
-    )
-    await message.answer(
-        "⚠️ Это удалит <b>все заказы из базы</b> и сбросит нумерацию.\n\n"
-        "После этого следующий пост будет <b>Заказ №000001</b>.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboard,
-    )
-
-
-@router.message(Command("drafts"))
-@only_admin
-async def cmd_drafts(message: Message) -> None:
-    with db_connect() as con:
-        rows = con.execute("SELECT * FROM orders WHERE status = 'draft' ORDER BY id DESC LIMIT 10").fetchall()
-    if not rows:
-        await message.answer("Черновиков нет.")
-        return
-    for row in rows:
-        await message.answer(build_draft_preview(row), parse_mode=ParseMode.HTML, reply_markup=draft_keyboard(int(row["id"])))
-
-
-@router.message(Command("stats", "earnings", "money"))
-@only_admin
-async def cmd_stats(message: Message) -> None:
-    with db_connect() as con:
-        row = con.execute(
-            """
-            SELECT
-                COUNT(*) AS cnt,
-                COALESCE(SUM(amount), 0) AS total,
-                COALESCE(AVG(NULLIF(amount, 0)), 0) AS avg_amount,
-                COALESCE(MAX(amount), 0) AS max_amount
-            FROM orders
-            WHERE status = 'published'
-            """
-        ).fetchone()
-        today = con.execute(
-            """
-            SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total
-            FROM orders
-            WHERE status = 'published' AND substr(COALESCE(published_at, created_at), 1, 10) = date('now', 'localtime')
-            """
-        ).fetchone()
-        month = con.execute(
-            """
-            SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total
-            FROM orders
-            WHERE status = 'published' AND substr(COALESCE(published_at, created_at), 1, 7) = strftime('%Y-%m', 'now', 'localtime')
-            """
-        ).fetchone()
-        drafts = con.execute("SELECT COUNT(*) AS cnt FROM orders WHERE status = 'draft'").fetchone()["cnt"]
-        best_cat = con.execute(
-            """
-            SELECT COALESCE(NULLIF(category, ''), 'Другое') AS category, COALESCE(SUM(amount), 0) AS total
-            FROM orders
-            WHERE status = 'published'
-            GROUP BY COALESCE(NULLIF(category, ''), 'Другое')
-            ORDER BY total DESC
-            LIMIT 1
-            """
-        ).fetchone()
-
-    avg_amount = int(float(row["avg_amount"] or 0))
-    month_total = int(month["total"] or 0)
-    goal_raw = get_state(f"goal:{current_month_key()}")
-    goal_block = ""
-    if goal_raw and goal_raw.isdigit() and int(goal_raw) > 0:
-        goal = int(goal_raw)
-        percent = min(100, int(month_total * 100 / goal)) if goal else 0
-        left = max(0, goal - month_total)
-        bar_fill = min(10, int(percent / 10))
-        bar = "█" * bar_fill + "░" * (10 - bar_fill)
-        goal_block = (
-            f"\n🎯 <b>Цель на {html.escape(current_month_ru())}:</b> {format_money(goal)}\n"
-            f"{bar} <b>{percent}%</b> · осталось {format_money(left)}\n"
-        )
-
-    best_category_text = "нет данных"
-    if best_cat:
-        best_category_text = f"{best_cat['category']} · {format_money(int(best_cat['total'] or 0))}"
-
-    await message.answer(
-        f"📊 <b>Статистика и заработок</b>\n\n"
-        f"💰 <b>За всё время:</b> {format_money(int(row['total']))}\n"
-        f"✅ Выполнено заказов: <b>{row['cnt']}</b>\n"
-        f"📆 <b>За сегодня:</b> {format_money(int(today['total']))} · заказов: <b>{today['cnt']}</b>\n"
-        f"🗓 <b>За этот месяц:</b> {format_money(month_total)} · заказов: <b>{month['cnt']}</b>\n"
-        f"📈 Средний чек: <b>{format_money(avg_amount)}</b>\n"
-        f"🏆 Самый крупный заказ: <b>{format_money(int(row['max_amount']))}</b>\n"
-        f"🏷 Лучшая категория: <b>{html.escape(best_category_text)}</b>\n"
-        f"📝 Черновиков на подтверждение: <b>{drafts}</b>"
-        f"{goal_block}",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@router.message(Command("goal"))
-@only_admin
-async def cmd_goal(message: Message, command: CommandObject) -> None:
-    key = f"goal:{current_month_key()}"
-    raw = (command.args or "").strip()
-    if not raw:
-        saved = get_state(key)
-        if saved and saved.isdigit() and int(saved) > 0:
-            await message.answer(
-                f"🎯 Текущая цель на {html.escape(current_month_ru())}: <b>{format_money(int(saved))}</b>\n\n"
-                "Изменить: <code>/goal 100000</code>\n"
-                "Убрать: <code>/goal 0</code>",
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            await message.answer("Цель на месяц не задана. Пример: <code>/goal 100000</code>", parse_mode=ParseMode.HTML)
-        return
-
-    amount = normalize_amount(raw)
+@router.message(Command("quickdone"))
+@active_required
+async def cmd_quickdone(message: Message, command: CommandObject, bot: Bot):
+    amount, service, comment = parse_done_args(command.args or "")
     if amount <= 0:
-        delete_state(key)
-        await message.answer("Цель на текущий месяц убрана ✅")
+        await message.answer("Пример: <code>/quickdone 3000 | Telegram-бот | Комментарий</code>", parse_mode=ParseMode.HTML)
         return
-    set_state(key, str(amount))
-    await message.answer(f"🎯 Поставил цель на {html.escape(current_month_ru())}: <b>{format_money(amount)}</b>", parse_mode=ParseMode.HTML)
+    row = ensure_user(message)
+    category = split_csv(row["categories"] or "")[:1]
+    order = create_order(message.from_user.id, amount, service, category[0] if category else "Другое", comment, source="manual", status="draft")
+    ok, result = await publish_order(bot, order["id"])
+    if not ok:
+        await message.answer(result)
 
 
-@router.message(Command("months", "month_stats"))
-@only_admin
-async def cmd_months(message: Message) -> None:
-    with db_connect() as con:
-        rows = con.execute(
-            """
-            SELECT substr(COALESCE(published_at, created_at), 1, 7) AS ym,
-                   COUNT(*) AS cnt,
-                   COALESCE(SUM(amount), 0) AS total,
-                   COALESCE(AVG(NULLIF(amount, 0)), 0) AS avg_amount
-            FROM orders
-            WHERE status = 'published'
-            GROUP BY ym
-            ORDER BY ym DESC
-            LIMIT 12
-            """
+@router.callback_query(F.data.startswith("pub:"))
+@active_required
+async def cb_publish(callback: CallbackQuery, bot: Bot):
+    order_id = int(callback.data.split(":", 1)[1])
+    row = get_order(order_id)
+    if not row or row["user_id"] != callback.from_user.id:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    ok, result = await publish_order(bot, order_id, notify_user=False)
+    await callback.answer(result, show_alert=not ok)
+    if ok:
+        await callback.message.edit_text(f"✅ Опубликовано\n\n{render_post(get_order(order_id))}", parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("skip:"))
+@private_access
+async def cb_skip(callback: CallbackQuery):
+    order_id = int(callback.data.split(":", 1)[1])
+    row = get_order(order_id)
+    if not row or row["user_id"] != callback.from_user.id:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    update_order(order_id, status="skipped", skipped_at=iso())
+    await callback.message.edit_text("🚫 Заказ пропущен.")
+    await callback.answer("Пропущено")
+
+
+@router.callback_query(F.data.startswith("edit:"))
+@active_required
+async def cb_edit(callback: CallbackQuery, state: FSMContext):
+    _, field, order_id_raw = callback.data.split(":", 2)
+    order_id = int(order_id_raw)
+    row = get_order(order_id)
+    if not row or row["user_id"] != callback.from_user.id:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    await state.set_state(EditOrderState.waiting_value)
+    await state.update_data(order_id=order_id, field=field)
+    prompts = {
+        "amount": "Введи новую сумму числом, например 5000",
+        "service": "Введи новое название услуги",
+        "category": "Введи категорию, например Telegram-боты",
+        "comment": "Введи комментарий. Чтобы очистить, напиши -",
+    }
+    await callback.message.answer(prompts.get(field, "Введи новое значение"))
+    await callback.answer()
+
+
+@router.message(EditOrderState.waiting_value)
+@private_access
+async def edit_order_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    order_id = int(data["order_id"])
+    field = data["field"]
+    row = get_order(order_id)
+    if not row or row["user_id"] != message.from_user.id:
+        await state.clear()
+        await message.answer("Заказ не найден.")
+        return
+    value = message.text.strip()
+    updates: dict[str, Any] = {}
+    if field == "amount":
+        amount = money_to_int(value)
+        if amount <= 0:
+            await message.answer("Сумма должна быть больше 0.")
+            return
+        updates["amount"] = amount
+    elif field == "comment" and value == "-":
+        updates["comment"] = ""
+    elif field in {"service", "category", "comment"}:
+        updates[field] = value
+    else:
+        await message.answer("Неизвестное поле.")
+        await state.clear()
+        return
+    update_order(order_id, **updates)
+    await state.clear()
+    row2 = get_order(order_id)
+    await message.answer(render_preview(row2), parse_mode=ParseMode.HTML, reply_markup=preview_keyboard(order_id))
+
+
+@router.message(Command("orders"))
+@private_access
+async def cmd_orders(message: Message):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM orders WHERE user_id=? AND status!='deleted' ORDER BY id DESC LIMIT 10",
+            (message.from_user.id,),
         ).fetchall()
     if not rows:
-        await message.answer("Пока нет опубликованных заказов для статистики по месяцам.")
+        await message.answer("Заказов пока нет.")
         return
-    lines = ["📅 <b>Статистика по месяцам</b>", ""]
-    for row in rows:
-        avg_amount = int(float(row["avg_amount"] or 0))
+    lines = ["📋 <b>Последние заказы</b>"]
+    for r in rows:
         lines.append(
-            f"<b>{html.escape(row['ym'])}</b>: {format_money(int(row['total'] or 0))} · заказов {row['cnt']} · средний {format_money(avg_amount)}"
+            f"№{int(r['public_number']):06d} — {html.escape(r['service'])} — {rub(int(r['amount']), r['currency'])} — {r['status']}"
         )
+    lines.append("\nУдалить: <code>/delete_order 2</code>")
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
-@router.message(Command("categories", "category_stats", "catstats"))
-@only_admin
-async def cmd_categories(message: Message) -> None:
-    with db_connect() as con:
-        rows = con.execute(
+@router.message(Command("delete_order", "del"))
+@private_access
+async def cmd_delete_order(message: Message, command: CommandObject, bot: Bot):
+    num = money_to_int(command.args or "")
+    if not num:
+        await message.answer("Пример: /delete_order 2")
+        return
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM orders WHERE user_id=? AND public_number=? AND status!='deleted'",
+            (message.from_user.id, num),
+        ).fetchone()
+    if not row:
+        await message.answer("Заказ не найден.")
+        return
+    # Try to delete channel post if exists
+    if row["channel_id"] and row["channel_message_id"]:
+        try:
+            await bot.delete_message(row["channel_id"], int(row["channel_message_id"]))
+        except Exception:
+            pass
+    update_order(row["id"], status="deleted", deleted_at=iso())
+    await message.answer(f"🗑 Заказ №{num:06d} удалён из статистики.")
+
+
+@router.message(Command("reset_orders", "reset"))
+@private_access
+async def cmd_reset_orders(message: Message):
+    with db() as conn:
+        conn.execute("DELETE FROM orders WHERE user_id=?", (message.from_user.id,))
+        conn.commit()
+    await message.answer("🧹 Все твои заказы удалены. Следующий будет №000001.")
+
+
+@router.message(Command("goal"))
+@private_access
+async def cmd_goal(message: Message, command: CommandObject):
+    amount = money_to_int(command.args or "")
+    if amount <= 0:
+        await message.answer("Пример: /goal 100000")
+        return
+    with db() as conn:
+        conn.execute("UPDATE users SET monthly_goal=?, updated_at=? WHERE tg_id=?", (amount, iso(), message.from_user.id))
+        conn.commit()
+    await message.answer(f"🎯 Цель месяца сохранена: {rub(amount)}")
+
+
+def stats_for_user(user_id: int) -> dict[str, Any]:
+    today = now_utc().strftime("%Y-%m-%d")
+    current_month = month_key()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM orders WHERE user_id=? AND status='published'",
+            (user_id,),
+        ).fetchall()
+    amounts = [int(r["amount"]) for r in rows]
+    today_amounts = [int(r["amount"]) for r in rows if (r["published_at"] or r["created_at"]).startswith(today)]
+    month_amounts = [int(r["amount"]) for r in rows if (r["published_at"] or r["created_at"]).startswith(current_month)]
+    return {
+        "count": len(rows),
+        "total": sum(amounts),
+        "today_count": len(today_amounts),
+        "today_total": sum(today_amounts),
+        "month_count": len(month_amounts),
+        "month_total": sum(month_amounts),
+        "avg": round(sum(amounts) / len(amounts)) if amounts else 0,
+        "max": max(amounts) if amounts else 0,
+    }
+
+
+@router.message(Command("stats", "earnings"))
+@private_access
+async def cmd_stats(message: Message):
+    user = ensure_user(message)
+    s = stats_for_user(message.from_user.id)
+    goal = int(user["monthly_goal"] or 0)
+    progress = round(s["month_total"] / goal * 100, 1) if goal else 0
+    text = (
+        "📊 <b>Статистика</b>\n\n"
+        f"За всё время: <b>{rub(s['total'], user['currency'])}</b>\n"
+        f"Выполненных заказов: <b>{s['count']}</b>\n"
+        f"Средний чек: <b>{rub(s['avg'], user['currency'])}</b>\n"
+        f"Самый крупный заказ: <b>{rub(s['max'], user['currency'])}</b>\n\n"
+        f"Сегодня: <b>{rub(s['today_total'], user['currency'])}</b> / {s['today_count']} заказов\n"
+        f"Этот месяц: <b>{rub(s['month_total'], user['currency'])}</b> / {s['month_count']} заказов\n"
+    )
+    if goal:
+        text += f"\n🎯 Цель месяца: <b>{rub(goal, user['currency'])}</b>\nПрогресс: <b>{progress}%</b>"
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("months"))
+@private_access
+async def cmd_months(message: Message):
+    with db() as conn:
+        rows = conn.execute(
             """
-            SELECT COALESCE(NULLIF(category, ''), 'Другое') AS category,
-                   COUNT(*) AS cnt,
-                   COALESCE(SUM(amount), 0) AS total,
-                   COALESCE(AVG(NULLIF(amount, 0)), 0) AS avg_amount
-            FROM orders
-            WHERE status = 'published'
-            GROUP BY COALESCE(NULLIF(category, ''), 'Другое')
-            ORDER BY total DESC
-            """
+            SELECT substr(COALESCE(published_at, created_at), 1, 7) AS m, COUNT(*) AS c, SUM(amount) AS s
+            FROM orders WHERE user_id=? AND status='published'
+            GROUP BY m ORDER BY m DESC LIMIT 12
+            """,
+            (message.from_user.id,),
         ).fetchall()
     if not rows:
-        await message.answer("Пока нет опубликованных заказов для статистики по категориям.")
+        await message.answer("Пока нет опубликованных заказов.")
         return
-    lines = ["🏷 <b>Категории заказов</b>", ""]
-    for row in rows:
-        avg_amount = int(float(row["avg_amount"] or 0))
-        lines.append(
-            f"<b>{html.escape(row['category'])}</b>: {format_money(int(row['total'] or 0))} · заказов {row['cnt']} · средний {format_money(avg_amount)}"
-        )
-    lines.extend(["", "Категории можно менять в Railway через <code>ORDER_CATEGORIES</code>."])
+    user = ensure_user(message)
+    lines = ["🗓 <b>Статистика по месяцам</b>"]
+    for r in rows:
+        lines.append(f"{r['m']}: {rub(int(r['s'] or 0), user['currency'])} / {r['c']} заказов")
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("categories"))
+@private_access
+async def cmd_categories(message: Message):
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT category, COUNT(*) AS c, SUM(amount) AS s
+            FROM orders WHERE user_id=? AND status='published'
+            GROUP BY category ORDER BY s DESC
+            """,
+            (message.from_user.id,),
+        ).fetchall()
+    if not rows:
+        await message.answer("Пока нет опубликованных заказов.")
+        return
+    user = ensure_user(message)
+    lines = ["🏷 <b>Статистика по категориям</b>"]
+    for r in rows:
+        lines.append(f"{html.escape(r['category'] or 'Другое')}: {rub(int(r['s'] or 0), user['currency'])} / {r['c']} заказов")
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("export"))
-@only_admin
-async def cmd_export(message: Message) -> None:
-    os.makedirs("data", exist_ok=True)
-    export_path = f"data/orders_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    with db_connect() as con:
-        rows = con.execute("SELECT * FROM orders ORDER BY id ASC").fetchall()
-    with open(export_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f, delimiter=";")
-        writer.writerow(["id", "status", "amount", "currency", "title", "category", "note", "source", "created_at", "published_at", "channel_message_id"])
-        for row in rows:
+@private_access
+async def cmd_export(message: Message, bot: Bot):
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM orders WHERE user_id=? ORDER BY id", (message.from_user.id,)).fetchall()
+    if not rows:
+        await message.answer("Экспортировать нечего.")
+        return
+    fd, path = tempfile.mkstemp(prefix="orders_", suffix=".csv")
+    os.close(fd)
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["number", "status", "amount", "currency", "service", "category", "comment", "source", "created_at", "published_at"])
+        for r in rows:
             writer.writerow([
-                row["id"], row["status"], row["amount"], row["currency"], row["title"], row["category"], row["note"],
-                row["source"], row["created_at"], row["published_at"], row["channel_message_id"],
+                r["public_number"], r["status"], r["amount"], r["currency"], r["service"], r["category"], r["comment"], r["source"], r["created_at"], r["published_at"]
             ])
-    await message.answer_document(FSInputFile(export_path), caption="Готово, выгрузка заказов в CSV ✅")
+    await bot.send_document(message.chat.id, FSInputFile(path, filename="orders.csv"))
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 @router.message(Command("backup"))
-@only_admin
-async def cmd_backup(message: Message) -> None:
-    if not os.path.exists(settings.db_path):
-        await message.answer("База пока не создана.")
+@private_access
+async def cmd_backup(message: Message, bot: Bot):
+    # For public SaaS users give CSV, owners can get full DB.
+    if message.from_user.id not in OWNER_IDS:
+        await cmd_export(message, bot)
         return
-    await message.answer_document(FSInputFile(settings.db_path), caption="Бэкап базы SQLite ✅")
+    await bot.send_document(message.chat.id, FSInputFile(DB_PATH, filename="orders_backup.db"))
 
 
-# ========================
-# Edit states
-# ========================
-
-@router.message(EditOrder.waiting_amount)
-@only_admin
-async def edit_wait_amount(message: Message, state: FSMContext, bot: Bot) -> None:
-    data = await state.get_data()
-    order_id = int(data["order_id"])
-    amount = normalize_amount(message.text or "")
-    if amount <= 0:
-        await message.answer("Сумма должна быть числом. Например: <code>3000</code>", parse_mode=ParseMode.HTML)
-        return
-    update_order(order_id, amount=amount)
-    await state.clear()
-    await send_draft_preview(bot, message.chat.id, order_id, "Сумму обновил ✅")
+@router.message(Command("subscription"))
+@private_access
+async def cmd_subscription(message: Message):
+    row = ensure_user(message)
+    await message.answer("💳 <b>Моя подписка</b>\n\n" + subscription_text(row), parse_mode=ParseMode.HTML)
 
 
-@router.message(EditOrder.waiting_title)
-@only_admin
-async def edit_wait_title(message: Message, state: FSMContext, bot: Bot) -> None:
-    data = await state.get_data()
-    order_id = int(data["order_id"])
-    title = clean_title(message.text or "")
-    update_order(order_id, title=title, category=detect_category(title))
-    await state.clear()
-    await send_draft_preview(bot, message.chat.id, order_id, "Название обновил ✅")
-
-
-@router.message(EditOrder.waiting_note)
-@only_admin
-async def edit_wait_note(message: Message, state: FSMContext, bot: Bot) -> None:
-    data = await state.get_data()
-    order_id = int(data["order_id"])
-    note = (message.text or "").strip()
-    if note == "-":
-        note = ""
-    update_order(order_id, note=note or None)
-    await state.clear()
-    await send_draft_preview(bot, message.chat.id, order_id, "Комментарий обновил ✅")
-
-
-@router.message(EditOrder.waiting_category)
-@only_admin
-async def edit_wait_category(message: Message, state: FSMContext, bot: Bot) -> None:
-    data = await state.get_data()
-    order_id = int(data["order_id"])
-    category = clean_category(message.text or "Другое")
-    update_order(order_id, category=category)
-    await state.clear()
-    await send_draft_preview(bot, message.chat.id, order_id, "Категорию обновил ✅")
-
-
-# ========================
-# Callbacks
-# ========================
-
-@router.callback_query(F.data.startswith("preview:"))
-async def cb_preview(callback: CallbackQuery) -> None:
-    if not is_admin_user(callback.from_user.id if callback.from_user else None):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    order_id = int(callback.data.split(":", 1)[1])
-    await edit_or_send_preview(callback, order_id)
-
-
-@router.callback_query(F.data.startswith("publish:"))
-async def cb_publish(callback: CallbackQuery, bot: Bot) -> None:
-    if not is_admin_user(callback.from_user.id if callback.from_user else None):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    order_id = int(callback.data.split(":", 1)[1])
-    msg_id = await publish_order(bot, order_id)
-    if not msg_id:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
-    await callback.answer("Опубликовано")
-    row = get_order(order_id)
-    if callback.message and row:
-        await callback.message.edit_text(
-            "✅ <b>Опубликовано в канал</b>\n\n" + build_post_text(row),
-            parse_mode=ParseMode.HTML,
-        )
-
-
-@router.callback_query(F.data.startswith("skip:"))
-async def cb_skip(callback: CallbackQuery) -> None:
-    if not is_admin_user(callback.from_user.id if callback.from_user else None):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    order_id = int(callback.data.split(":", 1)[1])
-    update_order(order_id, status="skipped")
-    await callback.answer("Пропущено")
-    if callback.message:
-        await callback.message.edit_text("🗑 Черновик пропущен", parse_mode=ParseMode.HTML)
-
-
-@router.callback_query(F.data.startswith("delete:"))
-async def cb_delete_order(callback: CallbackQuery, bot: Bot) -> None:
-    if not is_admin_user(callback.from_user.id if callback.from_user else None):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-
-    order_id = int(callback.data.split(":", 1)[1])
-    row = get_order(order_id)
-    if not row:
-        await callback.answer("Заказ уже удалён")
-        if callback.message:
-            await callback.message.edit_text("🗑 Заказ уже удалён")
-        return
-
-    await try_delete_channel_message(bot, row)
-    delete_order_record(order_id)
-    await callback.answer("Удалено")
-    if callback.message:
-        await callback.message.edit_text(f"🗑 Заказ №{order_id:06d} удалён из базы", parse_mode=ParseMode.HTML)
-
-
-@router.callback_query(F.data == "reset_orders_cancel")
-async def cb_reset_orders_cancel(callback: CallbackQuery) -> None:
-    if not is_admin_user(callback.from_user.id if callback.from_user else None):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    await callback.answer("Отменено")
-    if callback.message:
-        await callback.message.edit_text("Сброс заказов отменён.")
-
-
-@router.callback_query(F.data == "reset_orders_confirm")
-async def cb_reset_orders_confirm(callback: CallbackQuery, bot: Bot) -> None:
-    if not is_admin_user(callback.from_user.id if callback.from_user else None):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-
-    rows = get_recent_orders(30)
-    for row in rows:
-        await try_delete_channel_message(bot, row)
-
-    reset_orders_table()
-    await callback.answer("Сброшено")
-    if callback.message:
-        await callback.message.edit_text(
-            "✅ Все заказы удалены из базы. Нумерация сброшена.\n\n"
-            "Следующий заказ будет <b>№000001</b>.",
-            parse_mode=ParseMode.HTML,
-        )
-
-
-@router.callback_query(F.data.startswith("edit_amount:"))
-async def cb_edit_amount(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin_user(callback.from_user.id if callback.from_user else None):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    order_id = int(callback.data.split(":", 1)[1])
-    await state.set_state(EditOrder.waiting_amount)
-    await state.update_data(order_id=order_id)
-    await callback.answer()
-    if callback.message:
-        await callback.message.answer(f"Введи новую сумму для заказа №{order_id:06d}:", parse_mode=ParseMode.HTML)
-
-
-@router.callback_query(F.data.startswith("edit_title:"))
-async def cb_edit_title(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin_user(callback.from_user.id if callback.from_user else None):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    order_id = int(callback.data.split(":", 1)[1])
-    await state.set_state(EditOrder.waiting_title)
-    await state.update_data(order_id=order_id)
-    await callback.answer()
-    if callback.message:
-        await callback.message.answer(f"Введи новое название услуги для заказа №{order_id:06d}:", parse_mode=ParseMode.HTML)
-
-
-@router.callback_query(F.data.startswith("edit_note:"))
-async def cb_edit_note(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin_user(callback.from_user.id if callback.from_user else None):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    order_id = int(callback.data.split(":", 1)[1])
-    await state.set_state(EditOrder.waiting_note)
-    await state.update_data(order_id=order_id)
-    await callback.answer()
-    if callback.message:
-        await callback.message.answer("Введи новый комментарий. Чтобы убрать комментарий, отправь <code>-</code>.", parse_mode=ParseMode.HTML)
-
-
-@router.callback_query(F.data.startswith("edit_category:"))
-async def cb_edit_category(callback: CallbackQuery) -> None:
-    if not is_admin_user(callback.from_user.id if callback.from_user else None):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    order_id = int(callback.data.split(":", 1)[1])
-    await callback.answer()
-    if callback.message:
-        await callback.message.edit_text(
-            f"Выбери категорию для заказа №{order_id:06d}:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=category_keyboard(order_id),
-        )
-
-
-@router.callback_query(F.data.startswith("set_category:"))
-async def cb_set_category(callback: CallbackQuery) -> None:
-    if not is_admin_user(callback.from_user.id if callback.from_user else None):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    _, order_id_raw, idx_raw = callback.data.split(":", 2)
-    order_id = int(order_id_raw)
-    idx = int(idx_raw)
-    if idx < 0 or idx >= len(settings.categories):
-        await callback.answer("Категория не найдена", show_alert=True)
-        return
-    update_order(order_id, category=settings.categories[idx])
-    await edit_or_send_preview(callback, order_id, "Категорию обновил ✅")
-
-
-@router.callback_query(F.data.startswith("custom_category:"))
-async def cb_custom_category(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin_user(callback.from_user.id if callback.from_user else None):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    order_id = int(callback.data.split(":", 1)[1])
-    await state.set_state(EditOrder.waiting_category)
-    await state.update_data(order_id=order_id)
-    await callback.answer()
-    if callback.message:
-        await callback.message.answer("Напиши свою категорию, например: <code>Боты для бизнеса</code>", parse_mode=ParseMode.HTML)
-
-
-# ========================
-# IMAP / Kwork parsing
-# ========================
-
-def email_body_to_text(msg: EmailMessage) -> str:
-    body_part = msg.get_body(preferencelist=("plain", "html"))
-    if body_part is None:
-        return ""
-    content = body_part.get_content()
-    if body_part.get_content_type() == "text/html":
-        content = re.sub(r"<br\s*/?>", "\n", content, flags=re.I)
-        content = re.sub(r"</p>", "\n", content, flags=re.I)
-        content = re.sub(r"<[^>]+>", " ", content)
-        content = html.unescape(content)
-    content = re.sub(r"\r", "", content)
-    content = re.sub(r"[ \t]+", " ", content)
-    content = re.sub(r"\n{3,}", "\n\n", content)
-    return content.strip()
-
-
-def looks_like_completed_kwork(subject: str, sender: str, body: str) -> bool:
-    haystack = f"{subject}\n{sender}\n{body}".lower()
-    if settings.kwork_sender_filter and settings.kwork_sender_filter not in sender.lower() and settings.kwork_sender_filter not in haystack:
-        return False
-    if any(keyword in haystack for keyword in settings.kwork_ignore_keywords):
-        return False
-    return any(keyword in haystack for keyword in settings.kwork_success_keywords)
-
-
-def extract_amount(text: str) -> int:
-    patterns = [
-        r"(?:сумма|стоимость|доход|оплата|заработок|итого)\D{0,40}([0-9][0-9\s.,]{1,15})\s*(?:₽|руб\.?|р\.?|rub)",
-        r"([0-9][0-9\s.,]{1,15})\s*(?:₽|руб\.?|р\.?|rub)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.I)
-        if match:
-            value = normalize_amount(match.group(1))
-            if value > 0:
-                return value
-    return 0
-
-
-def extract_title(subject: str, body: str) -> str:
-    lines = [line.strip() for line in body.splitlines() if line.strip()]
-    patterns = [
-        r"^(?:заказ|кворк|услуга|название заказа)\s*[:№-]\s*(.+)$",
-        r"^(.{8,120})$",
-    ]
-    for line in lines[:30]:
-        match = re.search(patterns[0], line, flags=re.I)
-        if match:
-            candidate = clean_title(match.group(1))
-            if len(candidate) >= 5:
-                return candidate
-    return clean_title(subject) or "Заказ на Kwork"
-
-
-def parse_email_order(uid: str, raw: bytes) -> Optional[dict]:
-    msg = message_from_bytes(raw, policy=default)
-    subject = str(msg.get("subject", "") or "")
-    sender = str(msg.get("from", "") or "")
-    body = email_body_to_text(msg)
-
-    if not looks_like_completed_kwork(subject, sender, body):
-        return None
-
-    amount = extract_amount(f"{subject}\n{body}")
-    title = extract_title(subject, body)
-    note = "Автоматически найдено по уведомлению Kwork"
-    return {
-        "source": "kwork_email",
-        "source_uid": f"imap:{settings.imap_user}:{uid}",
-        "amount": amount,
-        "title": title,
-        "category": detect_category(title, body),
-        "note": note,
-        "raw_subject": subject,
-        "raw_from": sender,
-    }
-
-
-def imap_fetch_new_emails() -> list[tuple[str, bytes]]:
-    if not settings.imap_user or not settings.imap_password:
-        raise RuntimeError("Не указаны IMAP_USER или IMAP_PASSWORD")
-
-    with imaplib.IMAP4_SSL(settings.imap_host, settings.imap_port) as imap:
-        imap.login(settings.imap_user, settings.imap_password)
-        typ, _ = imap.select(settings.imap_folder)
-        if typ != "OK":
-            raise RuntimeError(f"Не удалось открыть папку IMAP: {settings.imap_folder}")
-
-        typ, data = imap.uid("search", None, "ALL")
-        if typ != "OK":
-            raise RuntimeError("IMAP SEARCH вернул ошибку")
-        uids = [uid.decode() for uid in data[0].split()] if data and data[0] else []
-        if not uids:
-            return []
-
-        last_uid_raw = get_state("imap_last_uid")
-        if last_uid_raw is None and settings.email_skip_old_on_first_run:
-            set_state("imap_last_uid", uids[-1])
-            return []
-
-        last_uid = int(last_uid_raw or "0")
-        new_uids = [uid for uid in uids if int(uid) > last_uid]
-        if not new_uids:
-            return []
-
-        fetched: list[tuple[str, bytes]] = []
-        for uid in new_uids[:50]:
-            typ, msg_data = imap.uid("fetch", uid, "(RFC822)")
-            if typ != "OK" or not msg_data:
-                continue
-            for part in msg_data:
-                if isinstance(part, tuple) and part[1]:
-                    fetched.append((uid, part[1]))
-                    break
-        set_state("imap_last_uid", new_uids[-1])
-        return fetched
-
-
-async def check_email_once(bot: Bot, manual: bool = False) -> int:
-    fetched = await asyncio.to_thread(imap_fetch_new_emails)
-    found = 0
-    for uid, raw in fetched:
-        parsed = parse_email_order(uid, raw)
-        if not parsed:
+@router.message(Command("plans"))
+@private_access
+async def cmd_plans(message: Message):
+    prices = plan_prices()
+    lines = ["💳 <b>Тарифы</b>", ""]
+    if TRIAL_DAYS:
+        lines.append(f"Trial: {TRIAL_DAYS} дней бесплатно")
+    for plan in PLANS:
+        if plan == "trial":
             continue
-        order_id = insert_order(
-            source=parsed["source"],
-            source_uid=parsed["source_uid"],
-            amount=parsed["amount"],
-            title=parsed["title"],
-            category=parsed["category"],
-            note=parsed["note"],
-            raw_subject=parsed["raw_subject"],
-            raw_from=parsed["raw_from"],
-            status="draft",
-        )
-        if not order_id:
-            continue
-        found += 1
-
-        if settings.auto_publish:
-            await publish_order(bot, order_id)
-            await notify_admins(bot, f"✅ Заказ из Kwork автоматически опубликован. ID: <b>{order_id}</b>")
+        price = prices.get(plan)
+        if price is not None:
+            lines.append(f"{plan}: <b>{price} ₽/мес</b>")
         else:
-            row = get_order(order_id)
-            if row:
-                await notify_admins(bot, "🧾 <b>Найден выполненный заказ из Kwork</b>\n\n" + build_draft_preview(row), reply_markup=draft_keyboard(order_id))
-    return found
+            lines.append(plan)
+    lines.append("")
+    lines.append("MVP сейчас работает с ручной выдачей подписок владельцем бота.")
+    if SUBSCRIPTION_CONTACT_URL:
+        lines.append(f"Для подключения: {html.escape(SUBSCRIPTION_CONTACT_URL)}")
+    lines.append("\nВладелец может выдать доступ: <code>/grant USER_ID 30 pro</code>")
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
-async def email_watcher(bot: Bot) -> None:
-    if not settings.email_enabled:
+@router.message(Command("grant"))
+@owner_required
+async def cmd_grant(message: Message, command: CommandObject):
+    parts = (command.args or "").split()
+    if len(parts) < 2:
+        await message.answer("Пример: /grant 123456789 30 pro")
         return
-    await notify_admins(bot, "📬 Проверка почты Kwork включена.")
+    try:
+        user_id = int(parts[0])
+        days = int(parts[1])
+    except ValueError:
+        await message.answer("USER_ID и DAYS должны быть числами.")
+        return
+    plan = parts[2] if len(parts) >= 3 else "pro"
+    row = get_user(user_id)
+    if not row:
+        await message.answer("Такой пользователь ещё не нажимал /start.")
+        return
+    current_paid = parse_dt(row["paid_until"])
+    base = current_paid if current_paid and current_paid > now_utc() else now_utc()
+    paid_until = base + timedelta(days=days)
+    with db() as conn:
+        conn.execute("UPDATE users SET plan=?, paid_until=?, updated_at=? WHERE tg_id=?", (plan, iso(paid_until), iso(), user_id))
+        conn.execute(
+            "INSERT INTO subscription_events (user_id, admin_id, action, days, plan, created_at) VALUES (?, ?, 'grant', ?, ?, ?)",
+            (user_id, message.from_user.id, days, plan, iso()),
+        )
+        conn.commit()
+    await message.answer(f"✅ Выдано {days} дней пользователю {user_id}. Оплачено до {paid_until.strftime('%d.%m.%Y')}")
+
+
+@router.message(Command("revoke"))
+@owner_required
+async def cmd_revoke(message: Message, command: CommandObject):
+    try:
+        user_id = int((command.args or "").split()[0])
+    except Exception:
+        await message.answer("Пример: /revoke 123456789")
+        return
+    with db() as conn:
+        conn.execute("UPDATE users SET paid_until=?, trial_until=?, plan='free', updated_at=? WHERE tg_id=?", (iso(now_utc() - timedelta(days=1)), iso(now_utc() - timedelta(days=1)), iso(), user_id))
+        conn.execute("INSERT INTO subscription_events (user_id, admin_id, action, created_at) VALUES (?, ?, 'revoke', ?)", (user_id, message.from_user.id, iso()))
+        conn.commit()
+    await message.answer(f"✅ Доступ пользователя {user_id} отозван.")
+
+
+@router.message(Command("users"))
+@owner_required
+async def cmd_users(message: Message):
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT 20").fetchall()
+    lines = ["👥 <b>Последние пользователи</b>"]
+    for r in rows:
+        active = "✅" if is_sub_active(r) else "❌"
+        uname = f"@{r['username']}" if r["username"] else r["first_name"] or "—"
+        lines.append(f"{active} <code>{r['tg_id']}</code> {html.escape(uname)} / {html.escape(r['plan'])} / paid {fmt_date(r['paid_until'])}")
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("app_stats"))
+@owner_required
+async def cmd_app_stats(message: Message):
+    with db() as conn:
+        u = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+        active = conn.execute("SELECT * FROM users").fetchall()
+        orders = conn.execute("SELECT COUNT(*) AS c, COALESCE(SUM(amount),0) AS s FROM orders WHERE status='published'").fetchone()
+        emails = conn.execute("SELECT COUNT(*) AS c FROM users WHERE email_enabled=1").fetchone()["c"]
+    active_count = sum(1 for r in active if is_sub_active(r))
+    text = (
+        "📈 <b>Статистика приложения</b>\n\n"
+        f"Пользователей: <b>{u}</b>\n"
+        f"Активных подписок/trial: <b>{active_count}</b>\n"
+        f"Подключенных почт: <b>{emails}</b>\n"
+        f"Опубликованных заказов: <b>{orders['c']}</b>\n"
+        f"Сумма опубликованных заказов: <b>{rub(int(orders['s']))}</b>"
+    )
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+# -------------------- email parsing --------------------
+
+def mailbox_hash(row: sqlite3.Row) -> str:
+    return hashlib.sha256(f"{row['imap_host']}:{row['imap_user']}:{row['imap_folder']}".encode()).hexdigest()[:16]
+
+
+def extract_email_text(msg: EmailMessage) -> str:
+    parts: list[str] = []
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = str(part.get("Content-Disposition", "")).lower()
+            if "attachment" in disp:
+                continue
+            if ctype in {"text/plain", "text/html"}:
+                try:
+                    payload = part.get_content()
+                    if ctype == "text/html":
+                        payload = re.sub(r"<[^>]+>", " ", str(payload))
+                    parts.append(str(payload))
+                except Exception:
+                    pass
+    else:
+        try:
+            payload = msg.get_content()
+            if msg.get_content_type() == "text/html":
+                payload = re.sub(r"<[^>]+>", " ", str(payload))
+            parts.append(str(payload))
+        except Exception:
+            pass
+    return "\n".join(parts)
+
+
+def parse_kwork_order(subject: str, body: str, row: sqlite3.Row) -> Optional[dict[str, Any]]:
+    sender_filter = (row["sender_filter"] or DEFAULT_KWORK_SENDER_FILTER).lower()
+    combined = f"{subject}\n{body}".lower()
+    # Sender itself is checked before this, but keep subject/body fallback.
+    success = split_csv(row["success_keywords"] or ",".join(SUCCESS_KEYWORDS))
+    ignore = split_csv(row["ignore_keywords"] or ",".join(IGNORE_KEYWORDS))
+    if any(k.lower() in combined for k in ignore):
+        return None
+    if not any(k.lower() in combined for k in success):
+        return None
+    amount = 0
+    for pattern in [
+        r"(?:сумма|стоимость|оплата|зачислено|доход|к оплате)\D{0,30}(\d[\d\s.,]{1,12})\s*(?:₽|руб|рублей|р|RUB)",
+        r"(\d[\d\s.,]{1,12})\s*(?:₽|руб|рублей|р|RUB)",
+    ]:
+        m = re.search(pattern, combined, flags=re.IGNORECASE)
+        if m:
+            amount = money_to_int(m.group(1))
+            break
+    service = subject.strip() or "Заказ Kwork"
+    # Try extracting quoted or titled service from body.
+    for pattern in [
+        r"(?:заказ|кворк|проект)[:\s]+[«\"]?([^\n«»\"]{8,90})",
+        r"(?:услуга|название)[:\s]+[«\"]?([^\n«»\"]{8,90})",
+    ]:
+        m = re.search(pattern, body, flags=re.IGNORECASE)
+        if m:
+            service = m.group(1).strip(" .:-—\n\r\t")[:100]
+            break
+    if amount <= 0:
+        # Keep draft, but publishing will be blocked until the user edits the amount.
+        amount = 0
+    return {"amount": amount, "service": service[:120], "comment": "", "category": "Kwork"}
+
+
+async def send_email_preview(bot: Bot, row: sqlite3.Row, order: sqlite3.Row) -> None:
+    try:
+        if row["auto_publish"]:
+            ok, result = await publish_order(bot, order["id"], notify_user=False)
+            if not ok:
+                await bot.send_message(row["tg_id"], f"⚠️ Нашёл заказ в почте, но не смог опубликовать:\n{result}", parse_mode=ParseMode.HTML)
+            return
+        await bot.send_message(
+            row["tg_id"],
+            "📩 Нашёл письмо, похожее на завершённый заказ.\n\n" + render_preview(order),
+            parse_mode=ParseMode.HTML,
+            reply_markup=preview_keyboard(order["id"]),
+        )
+    except Exception as e:
+        print(f"Failed to send email preview to {row['tg_id']}: {e}")
+
+
+async def check_mailbox_for_user(bot: Bot, row: sqlite3.Row) -> None:
+    if not is_sub_active(row):
+        return
+    if not row["imap_user"] or not row["imap_password_enc"]:
+        return
+    mailbox = mailbox_hash(row)
+    try:
+        password = decrypt_secret(row["imap_password_enc"])
+        imap = imaplib.IMAP4_SSL(row["imap_host"] or DEFAULT_IMAP_HOST, int(row["imap_port"] or DEFAULT_IMAP_PORT), timeout=20)
+        imap.login(row["imap_user"], password)
+        imap.select(row["imap_folder"] or DEFAULT_IMAP_FOLDER)
+        status, data = imap.uid("search", None, "ALL")
+        if status != "OK":
+            imap.logout()
+            return
+        uids = (data[0] or b"").decode().split()
+        uids = uids[-EMAIL_MAX_PER_USER:]
+        if not row["mail_initialized"] and row["email_skip_old"]:
+            with db() as conn:
+                for uid in uids:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO processed_emails (user_id, mailbox, uid, created_at) VALUES (?, ?, ?, ?)",
+                        (row["tg_id"], mailbox, uid, iso()),
+                    )
+                conn.execute("UPDATE users SET mail_initialized=1 WHERE tg_id=?", (row["tg_id"],))
+                conn.commit()
+            imap.logout()
+            return
+        with db() as conn:
+            conn.execute("UPDATE users SET mail_initialized=1 WHERE tg_id=?", (row["tg_id"],))
+            conn.commit()
+        for uid in uids:
+            with db() as conn:
+                exists = conn.execute(
+                    "SELECT 1 FROM processed_emails WHERE user_id=? AND mailbox=? AND uid=?",
+                    (row["tg_id"], mailbox, uid),
+                ).fetchone()
+            if exists:
+                continue
+            status, msg_data = imap.uid("fetch", uid, "(BODY.PEEK[])")
+            if status != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
+                continue
+            raw = msg_data[0][1]
+            msg = message_from_bytes(raw, policy=default)
+            subject = str(msg.get("Subject", ""))
+            sender = str(msg.get("From", ""))
+            body = extract_email_text(msg)
+            sender_filter = (row["sender_filter"] or DEFAULT_KWORK_SENDER_FILTER).lower()
+            if sender_filter and sender_filter not in sender.lower():
+                with db() as conn:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO processed_emails (user_id, mailbox, uid, created_at) VALUES (?, ?, ?, ?)",
+                        (row["tg_id"], mailbox, uid, iso()),
+                    )
+                    conn.commit()
+                continue
+            parsed = parse_kwork_order(subject, body, row)
+            with db() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO processed_emails (user_id, mailbox, uid, created_at) VALUES (?, ?, ?, ?)",
+                    (row["tg_id"], mailbox, uid, iso()),
+                )
+                conn.commit()
+            if not parsed:
+                continue
+            dedupe = hashlib.sha256(f"{row['tg_id']}:{mailbox}:{uid}:{subject}".encode()).hexdigest()[:32]
+            order = create_order(
+                user_id=row["tg_id"],
+                amount=parsed["amount"],
+                service=parsed["service"],
+                category=parsed["category"],
+                comment=parsed["comment"],
+                source="email",
+                status="draft",
+                email_uid=uid,
+                email_subject=subject,
+                dedupe_key=dedupe,
+            )
+            await send_email_preview(bot, row, order)
+        imap.logout()
+    except Exception as e:
+        print(f"Mailbox check failed for {row['tg_id']} {row['imap_user']}: {e}")
+
+
+async def email_worker(bot: Bot):
+    await asyncio.sleep(5)
     while True:
         try:
-            await check_email_once(bot)
-        except Exception as exc:
-            await notify_admins(bot, f"⚠️ Ошибка проверки почты: <code>{html.escape(str(exc))}</code>")
-        await asyncio.sleep(settings.email_check_interval)
+            with db() as conn:
+                users = conn.execute("SELECT * FROM users WHERE email_enabled=1 AND is_blocked=0").fetchall()
+            for row in users:
+                await check_mailbox_for_user(bot, row)
+                await asyncio.sleep(1)
+        except Exception as e:
+            print(f"Email worker error: {e}")
+        await asyncio.sleep(max(20, EMAIL_CHECK_INTERVAL))
 
 
-@router.message(Command("checkmail"))
-@only_admin
-async def cmd_checkmail(message: Message, bot: Bot) -> None:
-    if not settings.email_enabled:
-        await message.answer("Проверка почты выключена. Поставь <code>EMAIL_ENABLED=true</code> в Railway Variables", parse_mode=ParseMode.HTML)
-        return
-    await message.answer("Проверяю почту…")
-    try:
-        count = await check_email_once(bot, manual=True)
-    except Exception as exc:
-        await message.answer(f"Ошибка проверки почты: <code>{html.escape(str(exc))}</code>", parse_mode=ParseMode.HTML)
-        return
-    await message.answer(f"Готово. Новых выполненных заказов найдено: <b>{count}</b>", parse_mode=ParseMode.HTML)
-
-
-async def setup_bot_commands(bot: Bot) -> None:
-    await bot.set_my_commands([
-        BotCommand(command="start", description="помощь и список команд"),
-        BotCommand(command="done", description="добавить выполненный заказ"),
-        BotCommand(command="quickdone", description="сразу опубликовать заказ"),
-        BotCommand(command="drafts", description="черновики и предпросмотр"),
-        BotCommand(command="orders", description="последние заказы"),
-        BotCommand(command="stats", description="статистика и заработок"),
-        BotCommand(command="months", description="статистика по месяцам"),
-        BotCommand(command="categories", description="статистика по категориям"),
-        BotCommand(command="goal", description="цель на месяц"),
-        BotCommand(command="export", description="выгрузить CSV"),
-        BotCommand(command="backup", description="скачать базу"),
-        BotCommand(command="checkmail", description="проверить почту сейчас"),
-        BotCommand(command="reset", description="сбросить заказы и нумерацию"),
-        BotCommand(command="whoami", description="показать мой Telegram ID"),
-        BotCommand(command="version", description="проверка версии"),
-    ])
-
-
-async def main() -> None:
+async def main():
     init_db()
-    bot = Bot(settings.bot_token)
-    await setup_bot_commands(bot)
-    print(
-        f"Starting OrderDone Bot {BUILD_VERSION}, db={settings.db_path}, email_enabled={settings.email_enabled}, "
-        f"admins={sorted(settings.admin_ids)}, allow_all={settings.allow_all_users}",
-        flush=True,
-    )
+    bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-
-    if settings.email_enabled:
-        asyncio.create_task(email_watcher(bot))
-
+    await set_bot_commands(bot)
+    print(f"Starting Kwork Proof Bot {BUILD_VERSION}")
+    asyncio.create_task(email_worker(bot))
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Bot stopped")
