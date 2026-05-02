@@ -1,7 +1,7 @@
 services:
-  kwork_order_autopost_bot:
+  kwork_proof_bot:
     build: .
-    container_name: kwork_order_autopost_bot
+    container_name: kwork_proof_bot
     restart: unless-stopped
     env_file:
       - .env

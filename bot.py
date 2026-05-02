@@ -37,7 +37,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BUILD_VERSION = "saas-v2-clean-ui-2026-05-02"
+BUILD_VERSION = "saas-v2.1-fix-deps-2026-05-02"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
