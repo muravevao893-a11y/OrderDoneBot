@@ -37,7 +37,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BUILD_VERSION = "saas-v1-2026-05-02"
+BUILD_VERSION = "saas-v2-clean-ui-2026-05-02"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -122,7 +122,7 @@ PLANS = split_csv(os.getenv("PLANS", "trial,starter,pro,business"))
 PLAN_PRICES_RAW = os.getenv("PLAN_PRICES", "starter=299,pro=599,business=999")
 SUBSCRIPTION_CONTACT_URL = os.getenv("SUBSCRIPTION_CONTACT_URL", "")
 DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "₽")
-DEFAULT_CONTACT_BUTTON_TEXT = os.getenv("DEFAULT_CONTACT_BUTTON_TEXT", "Заказать так же")
+DEFAULT_CONTACT_BUTTON_TEXT = os.getenv("DEFAULT_CONTACT_BUTTON_TEXT", "Связаться")
 DEFAULT_CATEGORIES = split_csv(
     os.getenv("DEFAULT_ORDER_CATEGORIES", "Telegram-боты,Парсеры,Автоматизация,GPT-боты,Сайты,Доработки,Другое")
 )
@@ -195,7 +195,7 @@ def init_db() -> None:
                 monthly_goal INTEGER NOT NULL DEFAULT 0,
                 channel_id TEXT,
                 contact_url TEXT,
-                contact_button_text TEXT NOT NULL DEFAULT 'Заказать так же',
+                contact_button_text TEXT NOT NULL DEFAULT 'Связаться',
                 currency TEXT NOT NULL DEFAULT '₽',
                 auto_publish INTEGER NOT NULL DEFAULT 0,
                 manual_preview INTEGER NOT NULL DEFAULT 1,
@@ -519,45 +519,47 @@ def post_keyboard(row: sqlite3.Row) -> Optional[InlineKeyboardMarkup]:
 def preview_keyboard(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="Опубликовать", callback_data=f"pub:{order_id}")],
             [
-                InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"pub:{order_id}"),
-                InlineKeyboardButton(text="🚫 Пропустить", callback_data=f"skip:{order_id}"),
+                InlineKeyboardButton(text="Сумма", callback_data=f"edit:amount:{order_id}"),
+                InlineKeyboardButton(text="Услуга", callback_data=f"edit:service:{order_id}"),
             ],
             [
-                InlineKeyboardButton(text="💰 Сумма", callback_data=f"edit:amount:{order_id}"),
-                InlineKeyboardButton(text="🧩 Услуга", callback_data=f"edit:service:{order_id}"),
+                InlineKeyboardButton(text="Категория", callback_data=f"edit:category:{order_id}"),
+                InlineKeyboardButton(text="Комментарий", callback_data=f"edit:comment:{order_id}"),
             ],
-            [
-                InlineKeyboardButton(text="🏷 Категория", callback_data=f"edit:category:{order_id}"),
-                InlineKeyboardButton(text="📝 Комментарий", callback_data=f"edit:comment:{order_id}"),
-            ],
+            [InlineKeyboardButton(text="Пропустить", callback_data=f"skip:{order_id}")],
         ]
     )
 
 
+def main_menu_keyboard(is_owner: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="Новый заказ", callback_data="menu:new_order"), InlineKeyboardButton(text="Статистика", callback_data="menu:stats")],
+        [InlineKeyboardButton(text="Настройки", callback_data="menu:settings"), InlineKeyboardButton(text="Подписка", callback_data="menu:subscription")],
+        [InlineKeyboardButton(text="Помощь", callback_data="menu:help")],
+    ]
+    if is_owner:
+        rows.append([InlineKeyboardButton(text="Админ", callback_data="menu:owner")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 def render_post(row: sqlite3.Row) -> str:
     service = html.escape(row["service"] or "Заказ")
-    category = html.escape(row["category"] or "Другое")
     comment = html.escape(row["comment"] or "")
     date = datetime.fromisoformat(row["created_at"]).strftime("%d.%m.%Y") if row["created_at"] else now_utc().strftime("%d.%m.%Y")
     lines = [
-        "✅ <b>ЗАКАЗ ВЫПОЛНЕН</b>",
+        "✅ <b>Заказ выполнен</b>",
         "",
-        f"💰 <b>Сумма:</b> {rub(int(row['amount']), row['currency'])}",
-        f"🧩 <b>Услуга:</b> {service}",
-        f"🏷 <b>Категория:</b> {category}",
-        f"📅 <b>Дата:</b> {date}",
-        f"🔢 <b>Заказ №:</b> {int(row['public_number']):06d}",
+        f"💰 {rub(int(row['amount']), row['currency'])}",
+        f"🛠 {service}",
+        f"📅 {date}",
+        f"№{int(row['public_number']):06d}",
     ]
     if comment:
-        lines += ["", f"📝 {comment}"]
-    lines += ["", "Спасибо за доверие 🙌"]
+        lines += ["", f"<i>{comment}</i>"]
     return "\n".join(lines)
-
-
 def render_preview(row: sqlite3.Row) -> str:
-    return "<b>Предпросмотр поста</b>\n\n" + render_post(row)
-
+    return "<b>Предпросмотр</b>\n\n" + render_post(row)
 
 async def publish_order(bot: Bot, order_id: int, notify_user: bool = True) -> tuple[bool, str]:
     row = get_order(order_id)
@@ -621,40 +623,30 @@ def parse_done_args(text: str) -> tuple[int, str, str]:
 
 async def set_bot_commands(bot: Bot) -> None:
     commands = [
-        BotCommand(command="start", description="Запуск и меню"),
-        BotCommand(command="setup", description="Настройка канала, кнопки и почты"),
-        BotCommand(command="done", description="Создать выполненный заказ"),
-        BotCommand(command="stats", description="Статистика заработка"),
-        BotCommand(command="subscription", description="Моя подписка"),
-        BotCommand(command="plans", description="Тарифы"),
-        BotCommand(command="settings", description="Мои настройки"),
-        BotCommand(command="version", description="Версия бота"),
+        BotCommand(command="start", description="Меню"),
+        BotCommand(command="menu", description="Меню"),
+        BotCommand(command="done", description="Новый заказ"),
+        BotCommand(command="stats", description="Статистика"),
+        BotCommand(command="settings", description="Настройки"),
+        BotCommand(command="setup", description="Быстрая настройка"),
+        BotCommand(command="subscription", description="Подписка"),
+        BotCommand(command="version", description="Версия"),
     ]
     await bot.set_my_commands(commands)
 
-
-@router.message(Command("start"))
+@router.message(Command("start", "menu"))
 @private_access
 async def cmd_start(message: Message):
     row = ensure_user(message)
     text = (
-        f"👋 Привет! Это <b>Kwork Proof Bot</b>.\n\n"
-        "Я могу автоматически делать красивые посты о выполненных заказах в твой Telegram-канал, "
-        "вести статистику заработка и ловить письма Kwork о завершённых заказах.\n\n"
-        f"<b>Версия:</b> {BUILD_VERSION}\n\n"
+        "<b>Kwork Proof</b>\n"
+        f"v{BUILD_VERSION}\n\n"
         f"{subscription_text(row)}\n\n"
-        "Главные команды:\n"
-        "/setup — быстрая настройка\n"
-        "/done 3000 | Telegram-бот | Комментарий — создать пост\n"
-        "/stats — заработок и заказы\n"
-        "/settings — текущие настройки\n"
-        "/plans — тарифы\n"
+        "<code>/done 3000 | Услуга | Комментарий</code>\n"
+        "<code>/setup</code> — настройка\n"
+        "<code>/stats</code> — статистика"
     )
-    if message.from_user.id in OWNER_IDS:
-        text += "\nКоманды владельца: /grant, /revoke, /users, /app_stats"
-    await message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-
+    await message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=main_menu_keyboard(message.from_user.id in OWNER_IDS))
 @router.message(Command("version"))
 @private_access
 async def cmd_version(message: Message):
@@ -667,45 +659,81 @@ async def cmd_whoami(message: Message):
     await message.answer(f"Твой Telegram ID: <code>{message.from_user.id}</code>", parse_mode=ParseMode.HTML)
 
 
+@router.callback_query(F.data.startswith("menu:"))
+@private_access
+async def cb_menu(callback: CallbackQuery):
+    action = callback.data.split(":", 1)[1]
+    row = ensure_user(callback.from_user)
+    if action == "new_order":
+        text = "<b>Новый заказ</b>\n\n<code>/done 3000 | Услуга | Комментарий</code>"
+    elif action == "stats":
+        st = stats_for_user(callback.from_user.id)
+        goal = int(row["monthly_goal"] or 0)
+        progress = round(st["month_total"] / goal * 100, 1) if goal else 0
+        text = (
+            "<b>Статистика</b>\n\n"
+            f"Всего: <b>{rub(st['total'], row['currency'])}</b>\n"
+            f"Заказов: <b>{st['count']}</b>\n"
+            f"Средний чек: <b>{rub(st['avg'], row['currency'])}</b>\n"
+            f"Месяц: <b>{rub(st['month_total'], row['currency'])}</b> · {st['month_count']}"
+        )
+        if goal:
+            text += f"\nЦель: <b>{rub(goal, row['currency'])}</b> · {progress}%"
+    elif action == "settings":
+        text = (
+            "<b>Настройки</b>\n\n"
+            f"Канал: <code>{html.escape(str(row['channel_id'] or '—'))}</code>\n"
+            f"Кнопка: <b>{html.escape(row['contact_button_text'] or DEFAULT_CONTACT_BUTTON_TEXT)}</b>\n"
+            f"Почта: <code>{html.escape(str(row['imap_user'] or '—'))}</code>\n"
+            f"Проверка: <b>{'вкл' if row['email_enabled'] else 'выкл'}</b>\n"
+            f"Автопубликация: <b>{'вкл' if row['auto_publish'] else 'выкл'}</b>\n\n"
+            "<code>/setup</code>"
+        )
+    elif action == "subscription":
+        text = "<b>Подписка</b>\n\n" + subscription_text(row)
+    elif action == "owner" and callback.from_user.id in OWNER_IDS:
+        text = "<b>Админ</b>\n\n<code>/users</code>\n<code>/app_stats</code>\n<code>/grant USER_ID 30 pro</code>\n<code>/revoke USER_ID</code>"
+    else:
+        text = (
+            "<b>Помощь</b>\n\n"
+            "<code>/done 3000 | Услуга | Комментарий</code>\n"
+            "<code>/orders</code>\n"
+            "<code>/stats</code>\n"
+            "<code>/settings</code>\n"
+            "<code>/setup</code>"
+        )
+    await callback.message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await callback.answer()
+
+
 @router.message(Command("setup"))
 @private_access
 async def cmd_setup(message: Message):
     text = (
-        "⚙️ <b>Быстрая настройка</b>\n\n"
-        "1. Добавь бота админом в свой канал.\n"
-        "2. Укажи канал:\n"
-        "<code>/set_channel @your_channel</code>\n\n"
-        "3. Укажи кнопку под постами:\n"
-        "<code>/set_contact https://t.me/username Заказать так же</code>\n\n"
-        "4. Подключи почту Kwork через пароль приложения Gmail:\n"
-        "<code>/set_email your@gmail.com APP_PASSWORD</code>\n\n"
-        "5. Включи проверку почты:\n"
-        "<code>/enable_email</code>\n\n"
-        "Для ручного теста:\n"
-        "<code>/done 3000 | Telegram-бот | Сделан бот и инструкция</code>"
+        "<b>Настройка</b>\n\n"
+        "1. Добавь бота админом в канал.\n"
+        "2. Укажи канал:\n<code>/set_channel @channel</code>\n\n"
+        "3. Укажи кнопку:\n<code>/set_contact https://t.me/username Связаться</code>\n\n"
+        "4. Подключи почту:\n<code>/set_email mail@gmail.com APP_PASSWORD</code>\n\n"
+        "5. Включи проверку:\n<code>/enable_email</code>"
     )
     await message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-
 @router.message(Command("settings"))
 @private_access
 async def cmd_settings(message: Message):
     row = ensure_user(message)
     text = (
-        "⚙️ <b>Твои настройки</b>\n\n"
-        f"Канал: <code>{html.escape(str(row['channel_id'] or 'не указан'))}</code>\n"
+        "<b>Настройки</b>\n\n"
+        f"Канал: <code>{html.escape(str(row['channel_id'] or '—'))}</code>\n"
         f"Кнопка: <b>{html.escape(row['contact_button_text'] or DEFAULT_CONTACT_BUTTON_TEXT)}</b>\n"
-        f"Ссылка кнопки: <code>{html.escape(str(row['contact_url'] or 'не указана'))}</code>\n"
+        f"Ссылка: <code>{html.escape(str(row['contact_url'] or '—'))}</code>\n"
         f"Валюта: <b>{html.escape(row['currency'] or DEFAULT_CURRENCY)}</b>\n"
-        f"Автопубликация почты: <b>{'да' if row['auto_publish'] else 'нет, сначала предпросмотр'}</b>\n"
-        f"Почта: <code>{html.escape(str(row['imap_user'] or 'не подключена'))}</code>\n"
-        f"Проверка почты: <b>{'включена' if row['email_enabled'] else 'выключена'}</b>\n"
-        f"Цель месяца: <b>{rub(int(row['monthly_goal']), row['currency']) if row['monthly_goal'] else 'не задана'}</b>\n\n"
-        f"{subscription_text(row)}"
+        f"Почта: <code>{html.escape(str(row['imap_user'] or '—'))}</code>\n"
+        f"Проверка: <b>{'вкл' if row['email_enabled'] else 'выкл'}</b>\n"
+        f"Автопубликация: <b>{'вкл' if row['auto_publish'] else 'выкл'}</b>\n"
+        f"Цель: <b>{rub(int(row['monthly_goal']), row['currency']) if row['monthly_goal'] else '—'}</b>"
     )
     await message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-
 @router.message(Command("set_channel"))
 @private_access
 async def cmd_set_channel(message: Message, command: CommandObject):
@@ -738,7 +766,7 @@ async def cmd_test_channel(message: Message, bot: Bot):
 async def cmd_set_contact(message: Message, command: CommandObject):
     args = (command.args or "").strip()
     if not args:
-        await message.answer("Пример: <code>/set_contact https://t.me/username Заказать так же</code>", parse_mode=ParseMode.HTML)
+        await message.answer("Пример: <code>/set_contact https://t.me/username Связаться</code>", parse_mode=ParseMode.HTML)
         return
     parts = args.split(maxsplit=1)
     url = parts[0].strip()
@@ -800,37 +828,31 @@ async def cmd_set_email(message: Message, command: CommandObject):
 async def cmd_enable_email(message: Message):
     row = ensure_user(message)
     if not row["imap_user"] or not row["imap_password_enc"]:
-        await message.answer("Сначала подключи почту: /set_email your@gmail.com APP_PASSWORD")
+        await message.answer("Сначала: <code>/set_email mail@gmail.com APP_PASSWORD</code>", parse_mode=ParseMode.HTML)
         return
     with db() as conn:
         conn.execute("UPDATE users SET email_enabled=1, updated_at=? WHERE tg_id=?", (iso(), message.from_user.id))
         conn.commit()
-    await message.answer("✅ Проверка почты включена. Новые найденные завершённые заказы будут попадать в предпросмотр или автопубликацию.")
-
-
+    await message.answer("✅ Проверка почты включена.")
 @router.message(Command("disable_email"))
 @private_access
 async def cmd_disable_email(message: Message):
     with db() as conn:
         conn.execute("UPDATE users SET email_enabled=0, updated_at=? WHERE tg_id=?", (iso(), message.from_user.id))
         conn.commit()
-    await message.answer("⏸ Проверка почты выключена.")
-
-
+    await message.answer("Проверка почты выключена.")
 @router.message(Command("autopublish"))
 @private_access
 async def cmd_autopublish(message: Message, command: CommandObject):
     arg = (command.args or "").strip().lower()
     if arg not in {"on", "off", "true", "false", "1", "0"}:
-        await message.answer("Пример: /autopublish on или /autopublish off")
+        await message.answer("Пример: <code>/autopublish on</code> или <code>/autopublish off</code>", parse_mode=ParseMode.HTML)
         return
     value = arg in {"on", "true", "1"}
     with db() as conn:
         conn.execute("UPDATE users SET auto_publish=?, updated_at=? WHERE tg_id=?", (1 if value else 0, iso(), message.from_user.id))
         conn.commit()
-    await message.answer(f"✅ Автопубликация: {'включена' if value else 'выключена, будет предпросмотр'}")
-
-
+    await message.answer(f"Автопубликация: <b>{'вкл' if value else 'выкл'}</b>", parse_mode=ParseMode.HTML)
 @router.message(Command("done"))
 @active_required
 async def cmd_done(message: Message, command: CommandObject, bot: Bot):
@@ -962,17 +984,13 @@ async def cmd_orders(message: Message):
             (message.from_user.id,),
         ).fetchall()
     if not rows:
-        await message.answer("Заказов пока нет.")
+        await message.answer("Заказов нет.")
         return
-    lines = ["📋 <b>Последние заказы</b>"]
+    lines = ["<b>Заказы</b>"]
     for r in rows:
-        lines.append(
-            f"№{int(r['public_number']):06d} — {html.escape(r['service'])} — {rub(int(r['amount']), r['currency'])} — {r['status']}"
-        )
-    lines.append("\nУдалить: <code>/delete_order 2</code>")
+        lines.append(f"№{int(r['public_number']):06d} · {rub(int(r['amount']), r['currency'])} · {html.escape(r['service'])} · {r['status']}")
+    lines.append("\n<code>/del 2</code> — удалить")
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
 @router.message(Command("delete_order", "del"))
 @private_access
 async def cmd_delete_order(message: Message, command: CommandObject, bot: Bot):
@@ -1051,19 +1069,17 @@ async def cmd_stats(message: Message):
     goal = int(user["monthly_goal"] or 0)
     progress = round(s["month_total"] / goal * 100, 1) if goal else 0
     text = (
-        "📊 <b>Статистика</b>\n\n"
-        f"За всё время: <b>{rub(s['total'], user['currency'])}</b>\n"
-        f"Выполненных заказов: <b>{s['count']}</b>\n"
+        "<b>Статистика</b>\n\n"
+        f"Всего: <b>{rub(s['total'], user['currency'])}</b>\n"
+        f"Заказов: <b>{s['count']}</b>\n"
         f"Средний чек: <b>{rub(s['avg'], user['currency'])}</b>\n"
-        f"Самый крупный заказ: <b>{rub(s['max'], user['currency'])}</b>\n\n"
-        f"Сегодня: <b>{rub(s['today_total'], user['currency'])}</b> / {s['today_count']} заказов\n"
-        f"Этот месяц: <b>{rub(s['month_total'], user['currency'])}</b> / {s['month_count']} заказов\n"
+        f"Максимум: <b>{rub(s['max'], user['currency'])}</b>\n\n"
+        f"Сегодня: <b>{rub(s['today_total'], user['currency'])}</b> · {s['today_count']}\n"
+        f"Месяц: <b>{rub(s['month_total'], user['currency'])}</b> · {s['month_count']}"
     )
     if goal:
-        text += f"\n🎯 Цель месяца: <b>{rub(goal, user['currency'])}</b>\nПрогресс: <b>{progress}%</b>"
+        text += f"\n\nЦель: <b>{rub(goal, user['currency'])}</b> · {progress}%"
     await message.answer(text, parse_mode=ParseMode.HTML)
-
-
 @router.message(Command("months"))
 @private_access
 async def cmd_months(message: Message):
@@ -1077,15 +1093,13 @@ async def cmd_months(message: Message):
             (message.from_user.id,),
         ).fetchall()
     if not rows:
-        await message.answer("Пока нет опубликованных заказов.")
+        await message.answer("Пока пусто.")
         return
     user = ensure_user(message)
-    lines = ["🗓 <b>Статистика по месяцам</b>"]
+    lines = ["<b>Месяцы</b>"]
     for r in rows:
-        lines.append(f"{r['m']}: {rub(int(r['s'] or 0), user['currency'])} / {r['c']} заказов")
+        lines.append(f"{r['m']} · {rub(int(r['s'] or 0), user['currency'])} · {r['c']}")
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
 @router.message(Command("categories"))
 @private_access
 async def cmd_categories(message: Message):
@@ -1099,15 +1113,13 @@ async def cmd_categories(message: Message):
             (message.from_user.id,),
         ).fetchall()
     if not rows:
-        await message.answer("Пока нет опубликованных заказов.")
+        await message.answer("Пока пусто.")
         return
     user = ensure_user(message)
-    lines = ["🏷 <b>Статистика по категориям</b>"]
+    lines = ["<b>Категории</b>"]
     for r in rows:
-        lines.append(f"{html.escape(r['category'] or 'Другое')}: {rub(int(r['s'] or 0), user['currency'])} / {r['c']} заказов")
+        lines.append(f"{html.escape(r['category'] or 'Другое')} · {rub(int(r['s'] or 0), user['currency'])} · {r['c']}")
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
 @router.message(Command("export"))
 @private_access
 async def cmd_export(message: Message, bot: Bot):
@@ -1146,32 +1158,22 @@ async def cmd_backup(message: Message, bot: Bot):
 @private_access
 async def cmd_subscription(message: Message):
     row = ensure_user(message)
-    await message.answer("💳 <b>Моя подписка</b>\n\n" + subscription_text(row), parse_mode=ParseMode.HTML)
-
-
+    await message.answer("<b>Подписка</b>\n\n" + subscription_text(row), parse_mode=ParseMode.HTML)
 @router.message(Command("plans"))
 @private_access
 async def cmd_plans(message: Message):
     prices = plan_prices()
-    lines = ["💳 <b>Тарифы</b>", ""]
+    lines = ["<b>Тарифы</b>", ""]
     if TRIAL_DAYS:
-        lines.append(f"Trial: {TRIAL_DAYS} дней бесплатно")
+        lines.append(f"trial · {TRIAL_DAYS} дней")
     for plan in PLANS:
         if plan == "trial":
             continue
         price = prices.get(plan)
-        if price is not None:
-            lines.append(f"{plan}: <b>{price} ₽/мес</b>")
-        else:
-            lines.append(plan)
-    lines.append("")
-    lines.append("MVP сейчас работает с ручной выдачей подписок владельцем бота.")
+        lines.append(f"{plan} · {price} ₽/мес" if price is not None else plan)
     if SUBSCRIPTION_CONTACT_URL:
-        lines.append(f"Для подключения: {html.escape(SUBSCRIPTION_CONTACT_URL)}")
-    lines.append("\nВладелец может выдать доступ: <code>/grant USER_ID 30 pro</code>")
+        lines += ["", html.escape(SUBSCRIPTION_CONTACT_URL)]
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-
 @router.message(Command("grant"))
 @owner_required
 async def cmd_grant(message: Message, command: CommandObject):
@@ -1241,16 +1243,14 @@ async def cmd_app_stats(message: Message):
         emails = conn.execute("SELECT COUNT(*) AS c FROM users WHERE email_enabled=1").fetchone()["c"]
     active_count = sum(1 for r in active if is_sub_active(r))
     text = (
-        "📈 <b>Статистика приложения</b>\n\n"
-        f"Пользователей: <b>{u}</b>\n"
-        f"Активных подписок/trial: <b>{active_count}</b>\n"
-        f"Подключенных почт: <b>{emails}</b>\n"
-        f"Опубликованных заказов: <b>{orders['c']}</b>\n"
-        f"Сумма опубликованных заказов: <b>{rub(int(orders['s']))}</b>"
+        "<b>Приложение</b>\n\n"
+        f"Пользователи: <b>{u}</b>\n"
+        f"Активные: <b>{active_count}</b>\n"
+        f"Почты: <b>{emails}</b>\n"
+        f"Заказы: <b>{orders['c']}</b>\n"
+        f"Сумма: <b>{rub(int(orders['s']))}</b>"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
-
-
 # -------------------- email parsing --------------------
 
 def mailbox_hash(row: sqlite3.Row) -> str:
@@ -1324,18 +1324,16 @@ async def send_email_preview(bot: Bot, row: sqlite3.Row, order: sqlite3.Row) -> 
         if row["auto_publish"]:
             ok, result = await publish_order(bot, order["id"], notify_user=False)
             if not ok:
-                await bot.send_message(row["tg_id"], f"⚠️ Нашёл заказ в почте, но не смог опубликовать:\n{result}", parse_mode=ParseMode.HTML)
+                await bot.send_message(row["tg_id"], f"Письмо найдено, публикация не прошла:\n{html.escape(result)}", parse_mode=ParseMode.HTML)
             return
         await bot.send_message(
             row["tg_id"],
-            "📩 Нашёл письмо, похожее на завершённый заказ.\n\n" + render_preview(order),
+            "<b>Найден заказ</b>\n\n" + render_post(order),
             parse_mode=ParseMode.HTML,
             reply_markup=preview_keyboard(order["id"]),
         )
     except Exception as e:
         print(f"Failed to send email preview to {row['tg_id']}: {e}")
-
-
 async def check_mailbox_for_user(bot: Bot, row: sqlite3.Row) -> None:
     if not is_sub_active(row):
         return
