@@ -1,0 +1,9 @@
+services:
+  kwork_order_autopost_bot:
+    build: .
+    container_name: kwork_order_autopost_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
